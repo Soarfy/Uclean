@@ -1,0 +1,32 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+*.egg
+
+# IDE
+.idea/
+.vscode/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Large binary files
+*.ply
+*.ply.gz
+*.pcd
+
+# Output files
+output/
+*.docx
+*.pdf
+
+# Data folders
+pointsdata/
+code/

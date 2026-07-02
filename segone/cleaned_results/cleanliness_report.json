@@ -1,0 +1,19 @@
+{
+  "average_cleanliness": 13.910876336352745,
+  "total_count": 1,
+  "formula": "cleanliness = (remaining_gray_mean × remaining_area) / (picked_gray_mean × segment_area)",
+  "details": [
+    {
+      "name": "region_1",
+      "display_name": "region_1",
+      "original_area": 230.71262253131758,
+      "cleanliness": 13.910876336352745,
+      "cleaned_area": 177.83307931910718,
+      "remaining_area": 52.8795432122104,
+      "remaining_gray_mean": 0.3342037578559078,
+      "picked_gray_mean": 0.5506468739564852,
+      "numerator": 17.672542055224575,
+      "denominator": 127.04118437917256
+    }
+  ]
+}

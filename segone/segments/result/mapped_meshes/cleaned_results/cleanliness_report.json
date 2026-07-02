@@ -1,0 +1,20 @@
+{
+    "average_cleanliness": 41.137849439326565,
+    "total_count": 1,
+    "formula": "cleanliness = sum(face_area * grayscale) / sum(segment_face_area * grayscale)",
+    "details": [
+        {
+            "name": "Mesh_IO9-3 LowerJawScan_region_1.ply",
+            "original_points": 6824,
+            "final_points": 4105,
+            "original_area": 224.77165473384164,
+            "remaining_area": 143.29257208770653,
+            "cleanliness": 41.137849439326565,
+            "numerator": 64.63422181542242,
+            "denominator": 157.1161903121606,
+            "dirty_area": 92.48196849673818,
+            "picked_gray_mean": 0.6990035754206059,
+            "remaining_gray_mean": 0.4510647054046954
+        }
+    ]
+}

@@ -1,0 +1,72 @@
+{
+    "average_cleanliness": 28.504859896157896,
+    "total_count": 5,
+    "formula": "cleanliness = sum(face_area * grayscale) / sum(segment_face_area * grayscale)",
+    "details": [
+        {
+            "name": "Mesh_insideface.ply",
+            "original_points": 20825,
+            "final_points": 16923,
+            "original_area": 603.7263661416864,
+            "remaining_area": 466.66023228691245,
+            "cleanliness": 44.231956716851926,
+            "numerator": 180.303482691051,
+            "denominator": 407.63171262183204,
+            "dirty_area": 227.32822993078105,
+            "picked_gray_mean": 0.6751928282127819,
+            "remaining_gray_mean": 0.3863699330184121
+        },
+        {
+            "name": "Mesh_outsideface.ply",
+            "original_points": 22179,
+            "final_points": 11827,
+            "original_area": 695.8829526698454,
+            "remaining_area": 338.7713198054776,
+            "cleanliness": 28.952271062177577,
+            "numerator": 121.1712624457291,
+            "denominator": 418.5207515690325,
+            "dirty_area": 297.3494891233034,
+            "picked_gray_mean": 0.6014240612782981,
+            "remaining_gray_mean": 0.35767863264017036
+        },
+        {
+            "name": "Mesh_upface.ply",
+            "original_points": 26076,
+            "final_points": 7960,
+            "original_area": 316.56219701911516,
+            "remaining_area": 136.31816975417976,
+            "cleanliness": 28.263026090140098,
+            "numerator": 61.705333431068084,
+            "denominator": 218.3252891401984,
+            "dirty_area": 156.61995570913032,
+            "picked_gray_mean": 0.6896758084068249,
+            "remaining_gray_mean": 0.45265670410877923
+        },
+        {
+            "name": "Mesh_baseface.ply",
+            "original_points": 16145,
+            "final_points": 3521,
+            "original_area": 192.0834892866604,
+            "remaining_area": 47.70642771126113,
+            "cleanliness": 18.139416148691225,
+            "numerator": 24.163546624001178,
+            "denominator": 133.21016743829762,
+            "dirty_area": 109.04662081429643,
+            "picked_gray_mean": 0.6935013932379036,
+            "remaining_gray_mean": 0.5065050514838142
+        },
+        {
+            "name": "Mesh_tips.ply",
+            "original_points": 38364,
+            "final_points": 11908,
+            "original_area": 674.9966030883847,
+            "remaining_area": 181.93523627877835,
+            "cleanliness": 17.290807150374068,
+            "numerator": 79.6312911694378,
+            "denominator": 460.54120248351194,
+            "dirty_area": 380.9099113140741,
+            "picked_gray_mean": 0.6822866965201562,
+            "remaining_gray_mean": 0.4376903166103526
+        }
+    ]
+}

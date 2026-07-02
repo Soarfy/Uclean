@@ -2652,15 +2652,17 @@ def process_single_mesh_cleanliness_advanced(input_path, output_dir, color_thres
 all_stats = []
 
 
-def batch_clean_mapped_meshes(mesh_dir):
+def batch_clean_mapped_meshes(mesh_dir, cleaned_result_dir=None):
     """
     处理模型并将结果直接保存为 JSON 报告。
     """
     global all_stats
     all_stats = []
-    if not os.path.exists(mesh_dir): return []
+    if not os.path.exists(mesh_dir):
+        return []
 
-    cleaned_result_dir = os.path.join(mesh_dir, "cleaned_results")
+    if cleaned_result_dir is None:
+        cleaned_result_dir = os.path.join(mesh_dir, "cleaned_results")
     os.makedirs(cleaned_result_dir, exist_ok=True)
 
     mesh_files = glob.glob(os.path.join(mesh_dir, "*.ply"))
@@ -2699,21 +2701,25 @@ def batch_clean_mapped_meshes(mesh_dir):
     return all_stats
 
 
-def batch_clean_segmented_pcds(output_base_dir, cleaned_result_dir):
+def batch_clean_segmented_pcds(output_base_dir, cleaned_result_dir=None):
     """
-    对 Seg_*.ply（register_and_segment2 的直接输出）做交互清理。
-    这样与 CleanSingletooth2.py 的输入类型一致，可避免 Mesh 映射/平滑带来的点密度和选点偏差。
+    对 mapped_meshes/Mesh_*.ply（register_and_segment2 映射回 Mesh 拓扑后的结果）做交互清理。
+    这样所有后续选点都统一在 mapped_meshes 的点云上进行，不再使用 Seg_*.ply 分割结果。
     """
     global all_stats
     all_stats = []
     if not os.path.exists(output_base_dir):
         return []
 
+    mesh_dir = os.path.join(output_base_dir, "mapped_meshes")
+    if cleaned_result_dir is None:
+        cleaned_result_dir = os.path.join(mesh_dir, "cleaned_results")
     os.makedirs(cleaned_result_dir, exist_ok=True)
-    seg_files = glob.glob(os.path.join(output_base_dir, "Seg_*.ply"))
+
+    mesh_files = glob.glob(os.path.join(mesh_dir, "Mesh_*.ply"))
     exclude_keywords = ["basedown"]  # 仅排除 basedown，其余分区全部参与清洁度运算
 
-    for f_path in seg_files:
+    for f_path in mesh_files:
         file_name = os.path.basename(f_path)
         if any(k in file_name.lower() for k in exclude_keywords):
             continue

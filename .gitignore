@@ -36,3 +36,5 @@ code/
 !pointsdata/*.ply
 !segmentationsply/
 !segmentationsply/*.ply
+!segmentationfolder/
+!segmentationfolder/**/*.ply

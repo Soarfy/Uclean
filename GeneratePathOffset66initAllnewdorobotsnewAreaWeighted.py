@@ -31,9 +31,9 @@ from scipy.spatial import cKDTree
 
 
 EPS = 1.0e-12
-# In this project only basedown is excluded.  baseface is a tooth-facing region
-# and must be measured.  Extra words support future explicitly named templates.
-DEFAULT_GINGIVA_WORDS = ("basedown", "gum", "gingiva", "牙龈", "牙肉")
+# In this project only basedown is excluded.  baseface and every other mesh
+# region must be measured.
+DEFAULT_GINGIVA_WORDS = ("basedown",)
 
 # Kept for compatibility with CleanUI.py, which reads this module variable.
 all_stats: List[dict] = []
@@ -189,6 +189,76 @@ def build_standard_region_labels(
     distance_columns = [tree.query(vertices, k=1, workers=-1)[0] for tree in trees]
     labels = np.argmin(np.column_stack(distance_columns), axis=1).astype(np.int32)
     return labels, names, gingiva
+
+
+def load_template_region_references(
+    template_dir: os.PathLike | str,
+    gingiva_words: Sequence[str] = DEFAULT_GINGIVA_WORDS,
+) -> Tuple[List[str], List[cKDTree], List[bool]]:
+    """Load each segmentation mesh as a direct geometric region reference.
+
+    Unlike ``build_standard_region_labels``, this does not first paint labels
+    onto the vertices of the complete standard mesh.  Consequently a region
+    boundary is governed by the actual meshes in ``template_dir`` rather than
+    by the vertex density/topology of the standard mesh.
+    """
+    paths = sorted(Path(template_dir).glob("*.ply"))
+    if not paths:
+        raise FileNotFoundError(f"No PLY templates in {template_dir}")
+
+    names: List[str] = []
+    trees: List[cKDTree] = []
+    gingiva: List[bool] = []
+    for path in paths:
+        template = o3d.io.read_triangle_mesh(str(path), enable_post_processing=False)
+        points = np.asarray(template.vertices)
+        if len(points) == 0:
+            points = np.asarray(o3d.io.read_point_cloud(str(path)).points)
+        if len(points) == 0:
+            print(f"      skip empty template: {path.name}")
+            continue
+        names.append(path.stem)
+        trees.append(cKDTree(points))
+        gingiva.append(_is_gingiva(path.stem, gingiva_words))
+    if not trees:
+        raise ValueError("All segmentation templates are empty")
+    return names, trees, gingiva
+
+
+def label_mesh_faces_from_templates(
+    mesh: o3d.geometry.TriangleMesh,
+    template_trees: Sequence[cKDTree],
+    max_distance: float,
+) -> np.ndarray:
+    """Crop/label aligned scan faces directly against segmentation meshes."""
+    vertices = np.asarray(mesh.vertices)
+    faces = np.asarray(mesh.triangles)
+    centroids = vertices[faces].mean(axis=1)
+    distance_columns = [tree.query(centroids, k=1, workers=-1)[0] for tree in template_trees]
+    distances = np.column_stack(distance_columns)
+    labels = np.argmin(distances, axis=1).astype(np.int32)
+    labels[np.min(distances, axis=1) > max_distance] = -1
+    return labels
+
+
+def extract_face_mesh(
+    mesh: o3d.geometry.TriangleMesh,
+    face_indices: np.ndarray,
+) -> o3d.geometry.TriangleMesh:
+    """Create a compact triangle mesh from selected faces, preserving RGB."""
+    source_vertices = np.asarray(mesh.vertices)
+    selected_faces = np.asarray(mesh.triangles)[face_indices]
+    used_vertices, inverse = np.unique(selected_faces.reshape(-1), return_inverse=True)
+    cropped = o3d.geometry.TriangleMesh(
+        o3d.utility.Vector3dVector(source_vertices[used_vertices].copy()),
+        o3d.utility.Vector3iVector(inverse.reshape(-1, 3).astype(np.int32)),
+    )
+    if mesh.has_vertex_colors():
+        cropped.vertex_colors = o3d.utility.Vector3dVector(
+            np.asarray(mesh.vertex_colors)[used_vertices].copy()
+        )
+    cropped.compute_vertex_normals()
+    return cropped
 
 
 def label_mesh_faces(
@@ -539,12 +609,14 @@ def show_region_gray_comparison(
     after_luminance: np.ndarray,
     region_name: str,
     output_dir: Path,
+    save_files: bool = True,
 ) -> None:
     """Show true 3-D region greys side by side and save both gray clouds."""
     before_cloud = make_region_gray_cloud(before_mesh, before_faces, before_luminance)
     after_cloud = make_region_gray_cloud(after_mesh, after_faces, after_luminance)
-    o3d.io.write_point_cloud(str(output_dir / f"{region_name}_unclean_gray3d.ply"), before_cloud)
-    o3d.io.write_point_cloud(str(output_dir / f"{region_name}_cleaned_gray3d.ply"), after_cloud)
+    if save_files:
+        o3d.io.write_point_cloud(str(output_dir / f"{region_name}_unclean_gray3d.ply"), before_cloud)
+        o3d.io.write_point_cloud(str(output_dir / f"{region_name}_cleaned_gray3d.ply"), after_cloud)
 
     before_points = np.asarray(before_cloud.points)
     after_display = o3d.geometry.PointCloud(after_cloud)
@@ -611,17 +683,29 @@ def calculate_cleanliness(
     voxel_size: Optional[float] = None,
     max_label_distance: Optional[float] = None,
     gingiva_words: Sequence[str] = DEFAULT_GINGIVA_WORDS,
-    visualize: bool = True,
+    visualize: Optional[bool] = None,
+    show_uv: bool = True,
+    show_matching_results: bool = True,
+    show_point_cloud_comparison: bool = True,
+    save_intermediate_results: bool = True,
 ) -> dict:
     """Run the full three-model measurement and write all results."""
     global all_stats
+    if visualize is not None:
+        show_uv = bool(visualize)
+        show_matching_results = bool(visualize)
+        show_point_cloud_comparison = bool(visualize)
     if uv_resolution < 256:
         raise ValueError("uv_resolution must be at least 256")
     out = Path(output_dir)
     uv_dir = out / "uv"
     gray3d_dir = out / "gray3d"
-    uv_dir.mkdir(parents=True, exist_ok=True)
-    gray3d_dir.mkdir(parents=True, exist_ok=True)
+    cropped_dir = out / "cropped_meshes"
+    out.mkdir(parents=True, exist_ok=True)
+    if save_intermediate_results:
+        uv_dir.mkdir(parents=True, exist_ok=True)
+        gray3d_dir.mkdir(parents=True, exist_ok=True)
+        cropped_dir.mkdir(parents=True, exist_ok=True)
 
     print("[1/5] Loading meshes ...")
     standard = _load_mesh(standard_model_path)
@@ -631,34 +715,35 @@ def calculate_cleanliness(
     print("[2/5] Registering unclean mesh to standard (PCA + ICP) ...")
     before_reg = register_mesh_to_standard(before, standard, voxel_size)
     print(f"      fitness={before_reg.fitness:.5f}, RMSE={before_reg.inlier_rmse:.5f}")
-    if visualize:
+    if show_matching_results:
         show_registration(standard, before_reg.mesh, "ICP - Unclean vs Standard (automatic, no picking)")
     print("[3/5] Registering cleaned mesh to standard (PCA + ICP) ...")
     after_reg = register_mesh_to_standard(after, standard, voxel_size)
     print(f"      fitness={after_reg.fitness:.5f}, RMSE={after_reg.inlier_rmse:.5f}")
-    if visualize:
+    if show_matching_results:
         show_registration(standard, after_reg.mesh, "ICP - Cleaned vs Standard (automatic, no picking)")
 
     print("[3b/5] Pairwise refinement: cleaned scan -> unclean scan ...")
     after_reg = refine_cleaned_to_unclean(after_reg, before_reg, standard, voxel_size)
-    if visualize:
+    if show_matching_results:
         show_pairwise_registration(before_reg.mesh, after_reg.mesh, standard)
 
-    o3d.io.write_triangle_mesh(str(out / "unclean_registered.ply"), before_reg.mesh)
-    o3d.io.write_triangle_mesh(str(out / "cleaned_registered.ply"), after_reg.mesh)
-    np.savetxt(out / "unclean_to_standard_transform.txt", before_reg.transformation, fmt="%.12g")
-    np.savetxt(out / "cleaned_to_standard_transform.txt", after_reg.transformation, fmt="%.12g")
+    if save_intermediate_results:
+        o3d.io.write_triangle_mesh(str(out / "unclean_registered.ply"), before_reg.mesh)
+        o3d.io.write_triangle_mesh(str(out / "cleaned_registered.ply"), after_reg.mesh)
+        np.savetxt(out / "unclean_to_standard_transform.txt", before_reg.transformation, fmt="%.12g")
+        np.savetxt(out / "cleaned_to_standard_transform.txt", after_reg.transformation, fmt="%.12g")
 
-    print("[4/5] Transferring template region labels (gingiva excluded) ...")
-    std_labels, region_names, gingiva_flags = build_standard_region_labels(
-        standard, template_dir, gingiva_words
+    print("[4/5] Cropping registered meshes directly with segmentation meshes ...")
+    region_names, template_trees, gingiva_flags = load_template_region_references(
+        template_dir, gingiva_words
     )
     std_v = np.asarray(standard.vertices)
     diagonal = float(np.linalg.norm(np.ptp(std_v, axis=0)))
     label_distance = float(max_label_distance or max(diagonal / 80.0, 0.20))
-    before_labels = label_mesh_faces(before_reg.mesh, std_v, std_labels, label_distance)
-    after_labels = label_mesh_faces(after_reg.mesh, std_v, std_labels, label_distance)
-    if visualize:
+    before_labels = label_mesh_faces_from_templates(before_reg.mesh, template_trees, label_distance)
+    after_labels = label_mesh_faces_from_templates(after_reg.mesh, template_trees, label_distance)
+    if show_matching_results:
         show_segmentation(before_reg.mesh, before_labels, region_names, gingiva_flags, "Segments - Unclean")
         show_segmentation(after_reg.mesh, after_labels, region_names, gingiva_flags, "Segments - Cleaned")
 
@@ -678,14 +763,41 @@ def calculate_cleanliness(
         after_lum_raw[after_tooth_vertices],
     )
 
+    # Integrate overall cleanliness from each complete scan instead of adding
+    # cropped regions. Unmatched faces remain included; only basedown is out.
+    excluded_ids = np.flatnonzero(np.asarray(gingiva_flags, dtype=bool))
+    before_overall_faces = np.flatnonzero(~np.isin(before_labels, excluded_ids))
+    after_overall_faces = np.flatnonzero(~np.isin(after_labels, excluded_ids))
+    if len(before_overall_faces) == 0 or len(after_overall_faces) == 0:
+        raise RuntimeError("No mesh faces remain after excluding basedown")
+    overall_before_3d = integrate_region_3d(
+        before_reg.mesh, before_overall_faces, before_lum
+    )
+    overall_after_3d = integrate_region_3d(
+        after_reg.mesh, after_overall_faces, after_lum
+    )
+
     print("[5/5] UV rasterisation and pixel integrals ...")
     details = []
     for region_id, name in enumerate(region_names):
+        bf = np.flatnonzero(before_labels == region_id)
+        af = np.flatnonzero(after_labels == region_id)
+
+        # Save every available crop (including excluded gingiva and a region
+        # present in only one scan) so segmentation errors remain inspectable.
+        if save_intermediate_results and len(bf):
+            o3d.io.write_triangle_mesh(
+                str(cropped_dir / f"{name}_unclean_cropped.ply"),
+                extract_face_mesh(before_reg.mesh, bf),
+            )
+        if save_intermediate_results and len(af):
+            o3d.io.write_triangle_mesh(
+                str(cropped_dir / f"{name}_cleaned_cropped.ply"),
+                extract_face_mesh(after_reg.mesh, af),
+            )
         if gingiva_flags[region_id]:
             print(f"      skip gingiva: {name}")
             continue
-        bf = np.flatnonzero(before_labels == region_id)
-        af = np.flatnonzero(after_labels == region_id)
         if len(bf) == 0 or len(af) == 0:
             print(f"      skip empty region: {name}")
             continue
@@ -695,12 +807,12 @@ def calculate_cleanliness(
         a_img, a_mask, am = rasterise_region_uv(
             after_reg.mesh, af, after_lum, uv_resolution, name
         )
-        _save_uv_png(uv_dir / f"{name}_unclean.png", b_img, b_mask)
-        _save_uv_png(uv_dir / f"{name}_cleaned.png", a_img, a_mask)
         comparison = make_uv_comparison(b_img, b_mask, a_img, a_mask, name)
-        comparison_path = uv_dir / f"{name}_comparison.png"
-        cv2.imwrite(str(comparison_path), comparison)
-        if visualize:
+        if save_intermediate_results:
+            _save_uv_png(uv_dir / f"{name}_unclean.png", b_img, b_mask)
+            _save_uv_png(uv_dir / f"{name}_cleaned.png", a_img, a_mask)
+            cv2.imwrite(str(uv_dir / f"{name}_comparison.png"), comparison)
+        if show_uv:
             preview_width = min(comparison.shape[1], 1600)
             preview_height = max(1, round(comparison.shape[0] * preview_width / comparison.shape[1]))
             preview = cv2.resize(comparison, (preview_width, preview_height), interpolation=cv2.INTER_AREA)
@@ -712,13 +824,13 @@ def calculate_cleanliness(
         b3d = integrate_region_3d(before_reg.mesh, bf, before_lum)
         a3d = integrate_region_3d(after_reg.mesh, af, after_lum)
         # Always save the 3-D greys; open a side-by-side window in visual mode.
-        if visualize:
+        if show_point_cloud_comparison:
             show_region_gray_comparison(
                 before_reg.mesh, bf, before_lum,
                 after_reg.mesh, af, after_lum,
-                name, gray3d_dir,
+                name, gray3d_dir, save_files=save_intermediate_results,
             )
-        else:
+        elif save_intermediate_results:
             o3d.io.write_point_cloud(
                 str(gray3d_dir / f"{name}_unclean_gray3d.ply"),
                 make_region_gray_cloud(before_reg.mesh, bf, before_lum),
@@ -754,12 +866,14 @@ def calculate_cleanliness(
         details.append(item)
         print(f"      {name}: {cleanliness:.2f}%")
 
-    total_before = sum(x["unclean_3d"]["darkness_integral_3d"] for x in details)
-    total_after = sum(x["cleaned_3d"]["darkness_integral_3d"] for x in details)
+    total_before = overall_before_3d["darkness_integral_3d"]
+    total_after = overall_after_3d["darkness_integral_3d"]
     total_cleanliness = float(np.clip((1.0 - total_after / max(total_before, EPS)) * 100.0, -100.0, 100.0))
     report = {
-        "method": "independent ICP + template segmentation + true 3-D triangle-area weighted darkness integral",
-        "formula": "cleanliness(%) = (1 - sum(cleaned_triangle_area * cleaned_darkness) / sum(unclean_triangle_area * unclean_darkness)) * 100",
+        "method": "independent ICP + complete scan meshes excluding basedown + true 3-D triangle-area weighted darkness integral",
+        "cropped_mesh_directory": str(cropped_dir) if save_intermediate_results else None,
+        "intermediate_results_saved": bool(save_intermediate_results),
+        "formula": "cleanliness(%) = (1 - cleaned_mesh_darkness_integral_excluding_basedown / unclean_mesh_darkness_integral_excluding_basedown) * 100",
         "uv_role": "visualisation only; UV values do not participate in cleanliness",
         "gingiva_excluded": [n for n, flag in zip(region_names, gingiva_flags) if flag],
         "uv_resolution": int(uv_resolution),
@@ -772,6 +886,10 @@ def calculate_cleanliness(
         "overall_cleanliness": total_cleanliness,
         "total_unclean_darkness_integral": float(total_before),
         "total_cleaned_darkness_integral": float(total_after),
+        "total_unclean_surface_area": float(overall_before_3d["surface_area"]),
+        "total_cleaned_surface_area": float(overall_after_3d["surface_area"]),
+        "overall_unclean_3d": overall_before_3d,
+        "overall_cleaned_3d": overall_after_3d,
         "total_count": len(details),
         "details": details,
     }

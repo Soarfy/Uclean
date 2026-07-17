@@ -98,8 +98,19 @@ class CleanlinessWindow(QMainWindow):
             layout.addLayout(row)
 
         controls = QHBoxLayout()
-        self.visualize_box = QCheckBox("展示 ICP、分区、3D灰度和 UV 中间过程")
-        self.visualize_box.setChecked(True)
+        self.show_uv_box = QCheckBox("显示 UV")
+        self.show_matching_box = QCheckBox("显示匹配结果")
+        self.show_point_cloud_box = QCheckBox("显示点云对比结果")
+        self.save_intermediate_box = QCheckBox("保存中间结果")
+        option_boxes = (
+            self.show_uv_box,
+            self.show_matching_box,
+            self.show_point_cloud_box,
+            self.save_intermediate_box,
+        )
+        for box in option_boxes:
+            box.setChecked(True)
+            controls.addWidget(box)
         self.run_button = QPushButton("开始计算清洁度")
         self.run_button.setMinimumHeight(44)
         self.run_button.setStyleSheet(
@@ -108,7 +119,6 @@ class CleanlinessWindow(QMainWindow):
             "QPushButton:disabled {background:#9abff2;}"
         )
         self.run_button.clicked.connect(self._run)
-        controls.addWidget(self.visualize_box)
         controls.addStretch(1)
         controls.addWidget(self.run_button)
         layout.addLayout(controls)
@@ -206,7 +216,10 @@ class CleanlinessWindow(QMainWindow):
                 cleaned_model_path=paths["cleaned"],
                 template_dir=paths["templates"],
                 output_dir=paths["output"],
-                visualize=self.visualize_box.isChecked(),
+                show_uv=self.show_uv_box.isChecked(),
+                show_matching_results=self.show_matching_box.isChecked(),
+                show_point_cloud_comparison=self.show_point_cloud_box.isChecked(),
+                save_intermediate_results=self.save_intermediate_box.isChecked(),
             )
             self._render_report(report)
             score = float(report.get("overall_cleanliness", 0.0))
@@ -264,8 +277,16 @@ class CleanlinessWindow(QMainWindow):
             self.table.setItem(row, 6, self._score_item(float(item.get("cleanliness", 0.0))))
 
         total_row = len(FIXED_REGION_ORDER)
-        before_area = sum(float(x.get("before_surface_area", 0.0)) for x in details.values())
-        after_area = sum(float(x.get("after_surface_area", 0.0)) for x in details.values())
+        # Overall values are measured on the complete meshes with basedown
+        # removed; they are intentionally not sums of the displayed regions.
+        before_area = float(report.get(
+            "total_unclean_surface_area",
+            sum(float(x.get("before_surface_area", 0.0)) for x in details.values()),
+        ))
+        after_area = float(report.get(
+            "total_cleaned_surface_area",
+            sum(float(x.get("after_surface_area", 0.0)) for x in details.values()),
+        ))
         self.table.setItem(total_row, 0, QTableWidgetItem("—"))
         total_name = QTableWidgetItem("全部有效区域")
         total_name.setFont(QFont("Microsoft YaHei", 10, QFont.Bold))

@@ -77,8 +77,8 @@ class SelectableCleanlinessWindow(QMainWindow):
 
     def _build_ui(self) -> None:
         self.setWindowTitle("可选分割区域牙模清洁度分析")
-        self.resize(1560, 980)
-        self.setMinimumSize(1380, 900)
+        self.resize(1800, 1000)
+        self.setMinimumSize(1500, 920)
         root = QWidget(self)
         self.setCentralWidget(root)
         layout = QVBoxLayout(root)
@@ -91,6 +91,7 @@ class SelectableCleanlinessWindow(QMainWindow):
 
         defaults = {
             "standard": self.project_dir / "pointsdata" / "LowerJawScans.ply",
+            "baseline": self.project_dir / "pointsdata" / "原始牙模 LowerJawScan.ply",
             "unclean": self.project_dir / "pointsdata" / "UncleanLowerJawScan.ply",
             "cleaned": self.project_dir / "pointsdata" / "IO9-3 LowerJawScan.ply",
             "segments": self.project_dir / "segmentationfolder",
@@ -98,6 +99,7 @@ class SelectableCleanlinessWindow(QMainWindow):
         }
         rows = (
             ("标准模型", "standard", False),
+            ("未染色原始牙模", "baseline", False),
             ("刷牙前模型", "unclean", False),
             ("刷牙后模型", "cleaned", False),
             ("分割方案文件夹", "segments", True),
@@ -201,6 +203,15 @@ class SelectableCleanlinessWindow(QMainWindow):
         self.table.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         self.table.verticalHeader().setDefaultSectionSize(36)
         result_layout.addWidget(self.table, 2)
+        self.formula_label = QLabel(
+            "计算公式：清洁度 = (1 - 刷后污渍积分 ÷ max(刷前污渍积分, ε)) × 100%"
+        )
+        self.formula_label.setWordWrap(True)
+        self.formula_label.setStyleSheet(
+            "QLabel {background:#f6f8fa;border:1px solid #d9d9d9;"
+            "padding:8px;color:#262626;font-weight:bold;}"
+        )
+        result_layout.addWidget(self.formula_label)
 
         splitter.addWidget(selection_panel)
         splitter.addWidget(result_panel)
@@ -208,12 +219,22 @@ class SelectableCleanlinessWindow(QMainWindow):
         layout.addWidget(splitter, 1)
 
         options = QHBoxLayout()
+        self.remove_baseline_box = QCheckBox("去除底色")
+        self.remove_baseline_box.setToolTip(
+            "三个模型分别配准和分割；刷前、刷后区域积分分别减去未染色区域积分后再计算"
+        )
+        self.remove_baseline_box.toggled.connect(
+            lambda checked: self.path_edits["baseline"].setEnabled(checked)
+        )
+        self.remove_baseline_box.toggled.connect(self._update_formula_preview)
+        self.path_edits["baseline"].setEnabled(False)
         self.show_matching_box = QCheckBox("显示配准结果")
         self.show_gray_box = QCheckBox("显示所选区域灰度对比")
         self.save_intermediate_box = QCheckBox("保存中间结果")
         self.show_matching_box.setChecked(True)
         self.show_gray_box.setChecked(False)
         self.save_intermediate_box.setChecked(True)
+        options.addWidget(self.remove_baseline_box)
         options.addWidget(self.show_matching_box)
         options.addWidget(self.show_gray_box)
         options.addWidget(self.save_intermediate_box)
@@ -248,6 +269,18 @@ class SelectableCleanlinessWindow(QMainWindow):
 
     def _mode(self) -> str:
         return MODE_DATA[self.mode_combo.currentText()]
+
+    def _update_formula_preview(self, remove_baseline: bool) -> None:
+        if remove_baseline:
+            self.formula_label.setText(
+                "去除底色公式：刷前净积分 = max(刷前原始积分 − 未染色底色积分, 0)；"
+                "刷后净积分 = max(刷后原始积分 − 未染色底色积分, 0)；"
+                "清洁度 = (1 − 刷后净积分 ÷ max(刷前净积分, ε)) × 100%。"
+            )
+        else:
+            self.formula_label.setText(
+                "原始模式公式：清洁度 = (1 − 刷后污渍积分 ÷ max(刷前污渍积分, ε)) × 100%。"
+            )
 
     def _open_auto_segmentation(self) -> None:
         script = self.project_dir / "AutoToothSegUI.py"
@@ -385,6 +418,8 @@ class SelectableCleanlinessWindow(QMainWindow):
         for key in ("standard", "unclean", "cleaned"):
             if not os.path.isfile(paths[key]):
                 raise FileNotFoundError(f"模型文件不存在：{paths[key]}")
+        if self.remove_baseline_box.isChecked() and not os.path.isfile(paths["baseline"]):
+            raise FileNotFoundError(f"未染色原始牙模不存在：{paths['baseline']}")
         if not os.path.isdir(paths["segments"]):
             raise FileNotFoundError(f"分割方案文件夹不存在：{paths['segments']}")
         if not self._selected_names():
@@ -400,10 +435,29 @@ class SelectableCleanlinessWindow(QMainWindow):
 
     def _render_report(self, report: dict) -> None:
         """Render one aggregate row per large region in a fixed order."""
-        self.table.setHorizontalHeaderLabels([
-            "大区域", "已选详细分区", "刷前面积(mm²)", "刷后面积(mm²)",
-            "刷前污渍积分", "刷后污渍积分", "清洁度",
-        ])
+        baseline_enabled = bool(report.get("baseline_removal", {}).get("enabled"))
+        if baseline_enabled:
+            headers = [
+                "大区域", "已选详细分区", "刷前面积(mm²)", "刷后面积(mm²)",
+                "未染色底色积分", "刷前原始积分", "刷前净污渍积分",
+                "刷后原始积分", "刷后净污渍积分", "清洁度",
+            ]
+            self.formula_label.setText(
+                "去除底色公式：刷前净积分 = max(刷前原始积分 − 未染色底色积分, 0)；"
+                "刷后净积分 = max(刷后原始积分 − 未染色底色积分, 0)；"
+                "清洁度 = (1 − 刷后净积分 ÷ max(刷前净积分, ε)) × 100%。"
+            )
+        else:
+            headers = [
+                "大区域", "已选详细分区", "刷前面积(mm²)", "刷后面积(mm²)",
+                "刷前污渍积分", "刷后污渍积分", "清洁度",
+            ]
+            self.formula_label.setText(
+                "原始模式公式：清洁度 = (1 − 刷后污渍积分 ÷ max(刷前污渍积分, ε)) × 100%。"
+            )
+        self.table.setColumnCount(len(headers))
+        self.table.setHorizontalHeaderLabels(headers)
+        score_column = len(headers) - 1
         by_group = {
             item.get("group", "").casefold(): item
             for item in report.get("group_details", [])
@@ -415,7 +469,7 @@ class SelectableCleanlinessWindow(QMainWindow):
             name_item.setFont(QFont("Microsoft YaHei", 10, QFont.Bold))
             self.table.setItem(row, 0, name_item)
             if item is None:
-                for column in range(1, 7):
+                for column in range(1, len(headers)):
                     cell = QTableWidgetItem("未选择" if column == 1 else "—")
                     cell.setForeground(QColor("#8c8c8c"))
                     self.table.setItem(row, column, cell)
@@ -424,31 +478,61 @@ class SelectableCleanlinessWindow(QMainWindow):
             self.table.setItem(row, 1, QTableWidgetItem(", ".join(modules)))
             before = item.get("unclean_3d", {})
             after = item.get("cleaned_3d", {})
-            values = (
+            values = [
                 item.get("before_surface_area", 0.0),
                 item.get("after_surface_area", 0.0),
-                before.get("darkness_integral_3d", 0.0),
-                after.get("darkness_integral_3d", 0.0),
-            )
+            ]
+            if baseline_enabled:
+                baseline = item.get("baseline_3d") or {}
+                values.extend([
+                    baseline.get("darkness_integral_3d", 0.0),
+                    before.get("raw_darkness_integral_3d", 0.0),
+                    before.get("darkness_integral_3d", 0.0),
+                    after.get("raw_darkness_integral_3d", 0.0),
+                    after.get("darkness_integral_3d", 0.0),
+                ])
+            else:
+                values.extend([
+                    before.get("darkness_integral_3d", 0.0),
+                    after.get("darkness_integral_3d", 0.0),
+                ])
             for column, value in enumerate(values, start=2):
                 self.table.setItem(row, column, QTableWidgetItem(f"{float(value):.6f}"))
-            self.table.setItem(row, 6, self._score_item(float(item.get("cleanliness", 0.0))))
+            self.table.setItem(
+                row, score_column,
+                self._score_item(float(item.get("cleanliness", 0.0)))
+            )
 
         row = len(GROUP_DISPLAY_ORDER)
         total = QTableWidgetItem("所选区域整体")
         total.setFont(QFont("Microsoft YaHei", 10, QFont.Bold))
         self.table.setItem(row, 0, total)
         self.table.setItem(row, 1, QTableWidgetItem("全部已选区域"))
-        totals = (
+        totals = [
             report.get("total_unclean_surface_area", 0.0),
             report.get("total_cleaned_surface_area", 0.0),
-            report.get("total_unclean_darkness_integral", 0.0),
-            report.get("total_cleaned_darkness_integral", 0.0),
-        )
+        ]
+        if baseline_enabled:
+            overall_baseline = report.get("overall_baseline_3d") or {}
+            overall_before = report.get("overall_unclean_3d") or {}
+            overall_after = report.get("overall_cleaned_3d") or {}
+            totals.extend([
+                overall_baseline.get("darkness_integral_3d", 0.0),
+                overall_before.get("raw_darkness_integral_3d", 0.0),
+                report.get("total_unclean_darkness_integral", 0.0),
+                overall_after.get("raw_darkness_integral_3d", 0.0),
+                report.get("total_cleaned_darkness_integral", 0.0),
+            ])
+        else:
+            totals.extend([
+                report.get("total_unclean_darkness_integral", 0.0),
+                report.get("total_cleaned_darkness_integral", 0.0),
+            ])
         for column, value in enumerate(totals, start=2):
             self.table.setItem(row, column, QTableWidgetItem(f"{float(value):.6f}"))
         self.table.setItem(
-            row, 6, self._score_item(float(report.get("overall_cleanliness", 0.0)))
+            row, score_column,
+            self._score_item(float(report.get("overall_cleanliness", 0.0)))
         )
         return
 
@@ -499,6 +583,7 @@ class SelectableCleanlinessWindow(QMainWindow):
         try:
             report = backend.calculate_selected_cleanliness(
                 standard_model_path=paths["standard"],
+                baseline_model_path=paths["baseline"],
                 unclean_model_path=paths["unclean"],
                 cleaned_model_path=paths["cleaned"],
                 segmentation_folder=paths["segments"],
@@ -508,11 +593,14 @@ class SelectableCleanlinessWindow(QMainWindow):
                 show_matching_results=self.show_matching_box.isChecked(),
                 show_point_cloud_comparison=self.show_gray_box.isChecked(),
                 save_intermediate_results=self.save_intermediate_box.isChecked(),
+                remove_baseline=self.remove_baseline_box.isChecked(),
             )
             self._render_report(report)
             score = float(report.get("overall_cleanliness", 0.0))
+            method_name = "已去除底色" if self.remove_baseline_box.isChecked() else "原始颜色"
             self.status_label.setText(
-                f"计算完成：有效区域 {report.get('total_count', 0)} 个，所选区域整体清洁度 {score:.2f}%"
+                f"计算完成（{method_name}）：有效区域 {report.get('total_count', 0)} 个，"
+                f"所选区域整体清洁度 {score:.2f}%"
             )
             QMessageBox.information(
                 self, "计算完成",

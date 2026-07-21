@@ -129,6 +129,38 @@ def _label_faces(
     return labels
 
 
+def _normalise_luminance_triplet(before, after, baseline,
+                                  before_sample, after_sample, baseline_sample):
+    """Apply one shared exposure scale to all three independently coloured scans."""
+    joined = np.concatenate([before_sample, after_sample, baseline_sample])
+    low, high = np.percentile(joined, [2.0, 98.0])
+    if high - low < core.EPS:
+        low, high = float(joined.min()), float(joined.max() + core.EPS)
+    scale = max(high - low, core.EPS)
+    normalise = lambda values: np.clip((values - low) / scale, 0.0, 1.0)
+    return normalise(before), normalise(after), normalise(baseline), {
+        "luminance_p02": float(low), "luminance_p98": float(high)
+    }
+
+
+def _subtract_baseline_integral(scan_stats: dict, baseline_stats: dict) -> dict:
+    """Subtract the segmented uncoloured-region darkness integral."""
+    result = dict(scan_stats)
+    raw = float(scan_stats["darkness_integral_3d"])
+    base = float(baseline_stats["darkness_integral_3d"])
+    residual = max(raw - base, 0.0)
+    area = float(scan_stats["surface_area"])
+    result.update({
+        "darkness_integral_3d": residual,
+        "mean_darkness_area_weighted": residual / max(area, core.EPS),
+        "gray_integral_3d": max(area - residual, 0.0),
+        "mean_gray_area_weighted": max(area - residual, 0.0) / max(area, core.EPS),
+        "raw_darkness_integral_3d": raw,
+        "baseline_darkness_integral_3d": base,
+    })
+    return result
+
+
 def calculate_selected_cleanliness(
     standard_model_path: str | Path,
     unclean_model_path: str | Path,
@@ -142,6 +174,8 @@ def calculate_selected_cleanliness(
     show_matching_results: bool = True,
     show_point_cloud_comparison: bool = False,
     save_intermediate_results: bool = True,
+    baseline_model_path: Optional[str | Path] = None,
+    remove_baseline: bool = False,
 ) -> dict:
     """Calculate cleanliness for exactly the selected segmentation modules."""
     all_regions = discover_regions(segmentation_folder, segmentation_mode)
@@ -164,13 +198,26 @@ def calculate_selected_cleanliness(
     standard = core._load_mesh(standard_model_path)
     before = core._load_mesh(unclean_model_path)
     after = core._load_mesh(cleaned_model_path)
+    baseline = None
+    baseline_reg = None
+    if remove_baseline:
+        if baseline_model_path is None:
+            raise ValueError("勾选去除底色后，必须提供未染色原始牙模")
+        baseline = core._load_mesh(baseline_model_path)
     print("[1/4] 自动配准刷前模型和刷后模型 ...")
     before_reg = core.register_mesh_to_standard(before, standard, voxel_size)
     after_reg = core.register_mesh_to_standard(after, standard, voxel_size)
     after_reg = core.refine_cleaned_to_unclean(after_reg, before_reg, standard, voxel_size)
+    if remove_baseline:
+        baseline_reg = core.register_mesh_to_standard(baseline, standard, voxel_size)
+        baseline_reg = core.refine_cleaned_to_unclean(
+            baseline_reg, before_reg, standard, voxel_size
+        )
     if show_matching_results:
         core.show_registration(standard, before_reg.mesh, "刷前模型 -> 标准模型")
         core.show_registration(standard, after_reg.mesh, "刷后模型 -> 标准模型")
+        if baseline_reg is not None:
+            core.show_registration(standard, baseline_reg.mesh, "未染色原始牙模 -> 标准模型")
 
     print("[2/4] 映射完整分割方案并提取所选区域 ...")
     # Label against the complete scheme first, so an unselected neighbouring
@@ -180,34 +227,80 @@ def calculate_selected_cleanliness(
     label_distance = float(max_label_distance or max(diagonal / 80.0, 0.20))
     before_labels = _label_faces(before_reg.mesh, trees, label_distance)
     after_labels = _label_faces(after_reg.mesh, trees, label_distance)
+    baseline_labels = (
+        _label_faces(baseline_reg.mesh, trees, label_distance)
+        if baseline_reg is not None else None
+    )
     before_selected_faces = np.flatnonzero(np.isin(before_labels, selected_ids))
     after_selected_faces = np.flatnonzero(np.isin(after_labels, selected_ids))
-    if not len(before_selected_faces) or not len(after_selected_faces):
+    baseline_selected_faces = (
+        np.flatnonzero(np.isin(baseline_labels, selected_ids))
+        if baseline_labels is not None else None
+    )
+    if (not len(before_selected_faces) or not len(after_selected_faces)
+            or (baseline_selected_faces is not None and not len(baseline_selected_faces))):
         raise RuntimeError("所选区域未映射到扫描模型，请检查模型配准和分割坐标")
 
     before_raw = core.rgb_to_luminance(np.asarray(before_reg.mesh.vertex_colors))
     after_raw = core.rgb_to_luminance(np.asarray(after_reg.mesh.vertex_colors))
     before_vertices = np.unique(np.asarray(before_reg.mesh.triangles)[before_selected_faces])
     after_vertices = np.unique(np.asarray(after_reg.mesh.triangles)[after_selected_faces])
-    before_lum, after_lum, exposure = core.normalise_luminance_pair(
-        before_raw, after_raw, before_raw[before_vertices], after_raw[after_vertices]
-    )
+    if baseline_reg is None:
+        before_lum, after_lum, exposure = core.normalise_luminance_pair(
+            before_raw, after_raw, before_raw[before_vertices], after_raw[after_vertices]
+        )
+        baseline_metadata = {"enabled": False}
+    else:
+        baseline_raw = core.rgb_to_luminance(
+            np.asarray(baseline_reg.mesh.vertex_colors)
+        )
+        if len(baseline_raw) != len(baseline_reg.mesh.vertices):
+            raise ValueError("未染色原始牙模没有完整的顶点颜色，无法去除底色")
+        baseline_vertices = np.unique(
+            np.asarray(baseline_reg.mesh.triangles)[baseline_selected_faces]
+        )
+        before_lum, after_lum, baseline_lum, exposure = _normalise_luminance_triplet(
+            before_raw, after_raw, baseline_raw,
+            before_raw[before_vertices], after_raw[after_vertices],
+            baseline_raw[baseline_vertices],
+        )
+        baseline_metadata = {
+            "enabled": True,
+            "model": str(Path(baseline_model_path)),
+            "method": "segment all three registered models; subtract uncoloured-region darkness integral from before/after integrals",
+            "registration": {
+                "fitness": baseline_reg.fitness,
+                "inlier_rmse": baseline_reg.inlier_rmse,
+            },
+        }
 
     print("[3/4] 计算所选区域的真实三维面积颜色积分 ...")
     details = []
     valid_before_parts: List[np.ndarray] = []
     valid_after_parts: List[np.ndarray] = []
+    valid_baseline_parts: List[np.ndarray] = []
     group_before_parts = {}
     group_after_parts = {}
+    group_baseline_parts = {}
     for region_id in selected_ids:
         region = all_regions[region_id]
         bf = np.flatnonzero(before_labels == region_id)
         af = np.flatnonzero(after_labels == region_id)
-        if not len(bf) or not len(af):
+        basef = (
+            np.flatnonzero(baseline_labels == region_id)
+            if baseline_labels is not None else None
+        )
+        if not len(bf) or not len(af) or (basef is not None and not len(basef)):
             print(f"      跳过未同时匹配区域：{region.name}")
             continue
-        b3d = core.integrate_region_3d(before_reg.mesh, bf, before_lum)
-        a3d = core.integrate_region_3d(after_reg.mesh, af, after_lum)
+        b3d_raw = core.integrate_region_3d(before_reg.mesh, bf, before_lum)
+        a3d_raw = core.integrate_region_3d(after_reg.mesh, af, after_lum)
+        base3d = (
+            core.integrate_region_3d(baseline_reg.mesh, basef, baseline_lum)
+            if basef is not None else None
+        )
+        b3d = _subtract_baseline_integral(b3d_raw, base3d) if base3d else b3d_raw
+        a3d = _subtract_baseline_integral(a3d_raw, base3d) if base3d else a3d_raw
         ratio = a3d["darkness_integral_3d"] / max(b3d["darkness_integral_3d"], core.EPS)
         score = float(np.clip((1.0 - ratio) * 100.0, -100.0, 100.0))
         details.append({
@@ -222,11 +315,16 @@ def calculate_selected_cleanliness(
             "after_faces": int(len(af)),
             "unclean_3d": b3d,
             "cleaned_3d": a3d,
+            "baseline_3d": base3d,
         })
         valid_before_parts.append(bf)
         valid_after_parts.append(af)
+        if basef is not None:
+            valid_baseline_parts.append(basef)
         group_before_parts.setdefault(region.group.casefold(), []).append(bf)
         group_after_parts.setdefault(region.group.casefold(), []).append(af)
+        if basef is not None:
+            group_baseline_parts.setdefault(region.group.casefold(), []).append(basef)
         if save_intermediate_results:
             o3d.io.write_triangle_mesh(
                 str(crop_dir / f"{region.name}_unclean.ply"),
@@ -236,6 +334,11 @@ def calculate_selected_cleanliness(
                 str(crop_dir / f"{region.name}_cleaned.ply"),
                 core.extract_face_mesh(after_reg.mesh, af),
             )
+            if basef is not None:
+                o3d.io.write_triangle_mesh(
+                    str(crop_dir / f"{region.name}_baseline_uncoloured.ply"),
+                    core.extract_face_mesh(baseline_reg.mesh, basef),
+                )
         if show_point_cloud_comparison:
             core.show_region_gray_comparison(
                 before_reg.mesh, bf, before_lum,
@@ -256,8 +359,23 @@ def calculate_selected_cleanliness(
             continue
         group_bf = np.unique(np.concatenate(before_parts))
         group_af = np.unique(np.concatenate(after_parts))
-        group_before = core.integrate_region_3d(before_reg.mesh, group_bf, before_lum)
-        group_after = core.integrate_region_3d(after_reg.mesh, group_af, after_lum)
+        group_before_raw = core.integrate_region_3d(before_reg.mesh, group_bf, before_lum)
+        group_after_raw = core.integrate_region_3d(after_reg.mesh, group_af, after_lum)
+        baseline_parts = group_baseline_parts.get(group, [])
+        group_base = None
+        if baseline_parts:
+            group_basef = np.unique(np.concatenate(baseline_parts))
+            group_base = core.integrate_region_3d(
+                baseline_reg.mesh, group_basef, baseline_lum
+            )
+        group_before = (
+            _subtract_baseline_integral(group_before_raw, group_base)
+            if group_base else group_before_raw
+        )
+        group_after = (
+            _subtract_baseline_integral(group_after_raw, group_base)
+            if group_base else group_after_raw
+        )
         ratio = group_after["darkness_integral_3d"] / max(
             group_before["darkness_integral_3d"], core.EPS
         )
@@ -276,25 +394,52 @@ def calculate_selected_cleanliness(
             "after_faces": int(len(group_af)),
             "unclean_3d": group_before,
             "cleaned_3d": group_after,
+            "baseline_3d": group_base,
         })
 
     # Integrate the selected union directly, preserving the reference method.
     overall_bf = np.unique(np.concatenate(valid_before_parts))
     overall_af = np.unique(np.concatenate(valid_after_parts))
-    overall_before = core.integrate_region_3d(before_reg.mesh, overall_bf, before_lum)
-    overall_after = core.integrate_region_3d(after_reg.mesh, overall_af, after_lum)
+    overall_before_raw = core.integrate_region_3d(before_reg.mesh, overall_bf, before_lum)
+    overall_after_raw = core.integrate_region_3d(after_reg.mesh, overall_af, after_lum)
+    overall_base = None
+    if valid_baseline_parts:
+        overall_basef = np.unique(np.concatenate(valid_baseline_parts))
+        overall_base = core.integrate_region_3d(
+            baseline_reg.mesh, overall_basef, baseline_lum
+        )
+    overall_before = (
+        _subtract_baseline_integral(overall_before_raw, overall_base)
+        if overall_base else overall_before_raw
+    )
+    overall_after = (
+        _subtract_baseline_integral(overall_after_raw, overall_base)
+        if overall_base else overall_after_raw
+    )
     total_before = overall_before["darkness_integral_3d"]
     total_after = overall_after["darkness_integral_3d"]
     overall_score = float(np.clip(
         (1.0 - total_after / max(total_before, core.EPS)) * 100.0, -100.0, 100.0
     ))
     report = {
-        "method": "selected segmentation modules + true-3D triangle-area weighted colour integral",
+        "method": (
+            "independently segmented before/after/baseline models + subtraction "
+            "of baseline region darkness integral"
+            if remove_baseline else
+            "selected segmentation modules + true-3D triangle-area weighted colour integral"
+        ),
         "segmentation_mode": segmentation_mode,
         "segmentation_folder": str(Path(segmentation_folder)),
         "selected_regions": [all_regions[i].name for i in selected_ids],
-        "formula": "cleanliness(%) = (1 - cleaned_selected_darkness_integral / unclean_selected_darkness_integral) * 100",
+        "formula": (
+            "cleanliness(%) = (1 - (cleaned_integral-baseline_integral) / "
+            "(unclean_integral-baseline_integral)) * 100"
+            if remove_baseline else
+            "cleanliness(%) = (1 - cleaned_selected_darkness_integral / "
+            "unclean_selected_darkness_integral) * 100"
+        ),
         "exposure_normalisation": exposure,
+        "baseline_removal": baseline_metadata,
         "max_label_distance": label_distance,
         "registration": {
             "unclean": {"fitness": before_reg.fitness, "inlier_rmse": before_reg.inlier_rmse},
@@ -307,6 +452,7 @@ def calculate_selected_cleanliness(
         "total_cleaned_surface_area": overall_after["surface_area"],
         "overall_unclean_3d": overall_before,
         "overall_cleaned_3d": overall_after,
+        "overall_baseline_3d": overall_base,
         "total_count": len(details),
         "selected_group_count": len(group_details),
         "group_details": group_details,

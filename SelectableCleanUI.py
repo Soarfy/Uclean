@@ -9,6 +9,7 @@ import traceback
 from pathlib import Path
 
 from PyQt5.QtCore import Qt
+from PyQt5.QtCore import QProcess
 from PyQt5.QtGui import QColor, QFont
 from PyQt5.QtWidgets import (
     QApplication,
@@ -54,6 +55,14 @@ MODE_DATA = {
     "详细细分区域": "detailed",
 }
 
+GROUP_DISPLAY_ORDER = (
+    ("insideface", "内侧面"),
+    ("outsideface", "外侧面"),
+    ("upface", "上槽牙（咬合面）"),
+    ("tips", "牙缝"),
+    ("baseface", "牙根区域（龈沟）"),
+)
+
 
 class SelectableCleanlinessWindow(QMainWindow):
     def __init__(self) -> None:
@@ -68,7 +77,8 @@ class SelectableCleanlinessWindow(QMainWindow):
 
     def _build_ui(self) -> None:
         self.setWindowTitle("可选分割区域牙模清洁度分析")
-        self.resize(1280, 860)
+        self.resize(1560, 980)
+        self.setMinimumSize(1380, 900)
         root = QWidget(self)
         self.setCentralWidget(root)
         layout = QVBoxLayout(root)
@@ -119,6 +129,9 @@ class SelectableCleanlinessWindow(QMainWindow):
         self.reload_button.clicked.connect(self._reload_regions)
         mode_row.addWidget(self.reload_button)
         mode_row.addStretch(1)
+        auto_seg_button = QPushButton("GPU 自动单牙分割…")
+        auto_seg_button.clicked.connect(self._open_auto_segmentation)
+        mode_row.addWidget(auto_seg_button)
         layout.addLayout(mode_row)
 
         splitter = QSplitter(Qt.Horizontal)
@@ -183,6 +196,10 @@ class SelectableCleanlinessWindow(QMainWindow):
         self.table.verticalHeader().setVisible(False)
         self.table.setAlternatingRowColors(True)
         self.table.setEditTriggers(QTableWidget.NoEditTriggers)
+        self.table.setWordWrap(False)
+        self.table.setMinimumHeight(285)
+        self.table.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.table.verticalHeader().setDefaultSectionSize(36)
         result_layout.addWidget(self.table, 2)
 
         splitter.addWidget(selection_panel)
@@ -231,6 +248,12 @@ class SelectableCleanlinessWindow(QMainWindow):
 
     def _mode(self) -> str:
         return MODE_DATA[self.mode_combo.currentText()]
+
+    def _open_auto_segmentation(self) -> None:
+        script = self.project_dir / "AutoToothSegUI.py"
+        started = QProcess.startDetached(sys.executable, [str(script)], str(self.project_dir))
+        if not started:
+            QMessageBox.critical(self, "启动失败", f"无法启动自动单牙分割模块：{script}")
 
     def _reload_regions(self, _value=None, show_errors: bool = True) -> None:
         self._clear_embedded_preview()
@@ -376,6 +399,59 @@ class SelectableCleanlinessWindow(QMainWindow):
         return item
 
     def _render_report(self, report: dict) -> None:
+        """Render one aggregate row per large region in a fixed order."""
+        self.table.setHorizontalHeaderLabels([
+            "大区域", "已选详细分区", "刷前面积(mm²)", "刷后面积(mm²)",
+            "刷前污渍积分", "刷后污渍积分", "清洁度",
+        ])
+        by_group = {
+            item.get("group", "").casefold(): item
+            for item in report.get("group_details", [])
+        }
+        self.table.setRowCount(len(GROUP_DISPLAY_ORDER) + 1)
+        for row, (group, chinese_name) in enumerate(GROUP_DISPLAY_ORDER):
+            item = by_group.get(group)
+            name_item = QTableWidgetItem(chinese_name)
+            name_item.setFont(QFont("Microsoft YaHei", 10, QFont.Bold))
+            self.table.setItem(row, 0, name_item)
+            if item is None:
+                for column in range(1, 7):
+                    cell = QTableWidgetItem("未选择" if column == 1 else "—")
+                    cell.setForeground(QColor("#8c8c8c"))
+                    self.table.setItem(row, column, cell)
+                continue
+            modules = item.get("selected_modules", [])
+            self.table.setItem(row, 1, QTableWidgetItem(", ".join(modules)))
+            before = item.get("unclean_3d", {})
+            after = item.get("cleaned_3d", {})
+            values = (
+                item.get("before_surface_area", 0.0),
+                item.get("after_surface_area", 0.0),
+                before.get("darkness_integral_3d", 0.0),
+                after.get("darkness_integral_3d", 0.0),
+            )
+            for column, value in enumerate(values, start=2):
+                self.table.setItem(row, column, QTableWidgetItem(f"{float(value):.6f}"))
+            self.table.setItem(row, 6, self._score_item(float(item.get("cleanliness", 0.0))))
+
+        row = len(GROUP_DISPLAY_ORDER)
+        total = QTableWidgetItem("所选区域整体")
+        total.setFont(QFont("Microsoft YaHei", 10, QFont.Bold))
+        self.table.setItem(row, 0, total)
+        self.table.setItem(row, 1, QTableWidgetItem("全部已选区域"))
+        totals = (
+            report.get("total_unclean_surface_area", 0.0),
+            report.get("total_cleaned_surface_area", 0.0),
+            report.get("total_unclean_darkness_integral", 0.0),
+            report.get("total_cleaned_darkness_integral", 0.0),
+        )
+        for column, value in enumerate(totals, start=2):
+            self.table.setItem(row, column, QTableWidgetItem(f"{float(value):.6f}"))
+        self.table.setItem(
+            row, 6, self._score_item(float(report.get("overall_cleanliness", 0.0)))
+        )
+        return
+
         details = report.get("details", [])
         self.table.setRowCount(len(details) + 1)
         for row, item in enumerate(details):

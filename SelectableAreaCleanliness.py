@@ -22,6 +22,12 @@ import GeneratePathOffset66initAllnewdorobotsnewAreaWeighted as core
 
 
 SEGMENTATION_MODES = ("standard", "detailed")
+REGION_GROUP_ORDER = ("insideface", "outsideface", "upface", "tips", "baseface")
+REGION_GROUP_NAMES_ZH = {
+    "insideface": "内侧面", "outsideface": "外侧面",
+    "upface": "上槽牙（咬合面）", "tips": "牙缝",
+    "baseface": "牙根区域（龈沟）",
+}
 
 
 @dataclass(frozen=True)
@@ -191,6 +197,8 @@ def calculate_selected_cleanliness(
     details = []
     valid_before_parts: List[np.ndarray] = []
     valid_after_parts: List[np.ndarray] = []
+    group_before_parts = {}
+    group_after_parts = {}
     for region_id in selected_ids:
         region = all_regions[region_id]
         bf = np.flatnonzero(before_labels == region_id)
@@ -217,6 +225,8 @@ def calculate_selected_cleanliness(
         })
         valid_before_parts.append(bf)
         valid_after_parts.append(af)
+        group_before_parts.setdefault(region.group.casefold(), []).append(bf)
+        group_after_parts.setdefault(region.group.casefold(), []).append(af)
         if save_intermediate_results:
             o3d.io.write_triangle_mesh(
                 str(crop_dir / f"{region.name}_unclean.ply"),
@@ -234,6 +244,39 @@ def calculate_selected_cleanliness(
             )
     if not details:
         raise RuntimeError("没有同时匹配到刷前和刷后模型的所选区域")
+
+    # Combine selected detailed modules by their owning large region.  The
+    # score is calculated from the union's before/after integrals, never by
+    # averaging the percentages of individual small modules.
+    group_details = []
+    for group in REGION_GROUP_ORDER:
+        before_parts = group_before_parts.get(group, [])
+        after_parts = group_after_parts.get(group, [])
+        if not before_parts or not after_parts:
+            continue
+        group_bf = np.unique(np.concatenate(before_parts))
+        group_af = np.unique(np.concatenate(after_parts))
+        group_before = core.integrate_region_3d(before_reg.mesh, group_bf, before_lum)
+        group_after = core.integrate_region_3d(after_reg.mesh, group_af, after_lum)
+        ratio = group_after["darkness_integral_3d"] / max(
+            group_before["darkness_integral_3d"], core.EPS
+        )
+        group_details.append({
+            "group": group,
+            "name_zh": REGION_GROUP_NAMES_ZH[group],
+            "selected_modules": [
+                item["name"] for item in details
+                if item["group"].casefold() == group
+            ],
+            "cleanliness": float(np.clip((1.0 - ratio) * 100.0, -100.0, 100.0)),
+            "integral_ratio_after_before": float(ratio),
+            "before_surface_area": group_before["surface_area"],
+            "after_surface_area": group_after["surface_area"],
+            "before_faces": int(len(group_bf)),
+            "after_faces": int(len(group_af)),
+            "unclean_3d": group_before,
+            "cleaned_3d": group_after,
+        })
 
     # Integrate the selected union directly, preserving the reference method.
     overall_bf = np.unique(np.concatenate(valid_before_parts))
@@ -265,6 +308,8 @@ def calculate_selected_cleanliness(
         "overall_unclean_3d": overall_before,
         "overall_cleaned_3d": overall_after,
         "total_count": len(details),
+        "selected_group_count": len(group_details),
+        "group_details": group_details,
         "details": details,
     }
     print("[4/4] 保存清洁度报告 ...")
@@ -280,6 +325,22 @@ def calculate_selected_cleanliness(
             writer.writerow([
                 item["name"], item["group"], item["cleanliness"],
                 item["unclean_3d"]["darkness_integral_3d"],
+                item["cleaned_3d"]["darkness_integral_3d"],
+                item["before_surface_area"], item["after_surface_area"],
+            ])
+    with (out / "selected_cleanliness_by_group.csv").open(
+        "w", newline="", encoding="utf-8-sig"
+    ) as fh:
+        writer = csv.writer(fh)
+        writer.writerow([
+            "group", "group_zh", "selected_modules", "cleanliness_percent",
+            "unclean_darkness_integral", "cleaned_darkness_integral",
+            "unclean_area_mm2", "cleaned_area_mm2",
+        ])
+        for item in group_details:
+            writer.writerow([
+                item["group"], item["name_zh"], ";".join(item["selected_modules"]),
+                item["cleanliness"], item["unclean_3d"]["darkness_integral_3d"],
                 item["cleaned_3d"]["darkness_integral_3d"],
                 item["before_surface_area"], item["after_surface_area"],
             ])

@@ -22,6 +22,7 @@ import GeneratePathOffset66initAllnewdorobotsnewAreaWeighted as core
 
 
 SEGMENTATION_MODES = ("standard", "detailed")
+COLOUR_SPACES = ("rgb", "hsv", "lab")
 REGION_GROUP_ORDER = ("insideface", "outsideface", "upface", "tips", "baseface")
 REGION_GROUP_NAMES_ZH = {
     "insideface": "内侧面", "outsideface": "外侧面",
@@ -143,6 +144,63 @@ def _normalise_luminance_triplet(before, after, baseline,
     }
 
 
+def colour_value(rgb: np.ndarray, colour_space: str) -> np.ndarray:
+    """Return luminance-like values whose inverse is the stain signal.
+
+    RGB is fixed-range grayscale (0..255), HSV is H (0..360), and Lab is a*
+    shifted from [-128,127] to [0,255]. Returned values are range-normalised.
+    """
+    rgb = np.clip(np.asarray(rgb, dtype=np.float64), 0.0, 1.0)[:, :3]
+    space = colour_space.casefold()
+    if space == "rgb":
+        return core.rgb_to_luminance(rgb)
+    if space == "hsv":
+        maximum = rgb.max(axis=1)
+        minimum = rgb.min(axis=1)
+        chroma = maximum - minimum
+        hue = np.zeros(len(rgb), dtype=np.float64)
+        active = chroma > core.EPS
+        r, g, b = rgb[:, 0], rgb[:, 1], rgb[:, 2]
+        mask = active & (maximum == r)
+        hue[mask] = np.mod((g[mask] - b[mask]) / chroma[mask], 6.0)
+        mask = active & (maximum == g)
+        hue[mask] = (b[mask] - r[mask]) / chroma[mask] + 2.0
+        mask = active & (maximum == b)
+        hue[mask] = (r[mask] - g[mask]) / chroma[mask] + 4.0
+        return np.mod(hue / 6.0, 1.0)
+    if space == "lab":
+        linear = np.where(
+            rgb <= 0.04045, rgb / 12.92, ((rgb + 0.055) / 1.055) ** 2.4
+        )
+        xyz = linear @ np.array([
+            [0.4124564, 0.3575761, 0.1804375],
+            [0.2126729, 0.7151522, 0.0721750],
+            [0.0193339, 0.1191920, 0.9503041],
+        ]).T
+        xyz /= np.array([0.95047, 1.0, 1.08883])
+        delta = 6.0 / 29.0
+        f = np.where(
+            xyz > delta ** 3, np.cbrt(xyz),
+            xyz / (3 * delta ** 2) + 4.0 / 29.0,
+        )
+        a_star = 500.0 * (f[:, 0] - f[:, 1])
+        return np.clip((a_star + 128.0) / 255.0, 0.0, 1.0)
+    raise ValueError("颜色空间必须是 rgb、hsv 或 lab")
+
+
+def apply_darkness_threshold(values: np.ndarray, enabled: bool,
+                             threshold: float, domain_max: float) -> np.ndarray:
+    if not enabled:
+        return values
+    # Subtract an offset from darkness, then convert back to brightness.
+    # In raw-domain units: darkness' = max(darkness - threshold, 0).
+    darkness = 1.0 - np.clip(values, 0.0, 1.0)
+    reduced_darkness = np.clip(
+        darkness - float(threshold) / max(float(domain_max), core.EPS), 0.0, 1.0
+    )
+    return 1.0 - reduced_darkness
+
+
 def _subtract_baseline_integral(scan_stats: dict, baseline_stats: dict) -> dict:
     """Subtract the segmented uncoloured-region darkness integral."""
     result = dict(scan_stats)
@@ -176,6 +234,9 @@ def calculate_selected_cleanliness(
     save_intermediate_results: bool = True,
     baseline_model_path: Optional[str | Path] = None,
     remove_baseline: bool = False,
+    colour_space: str = "rgb",
+    threshold_enabled: bool = False,
+    darkness_threshold: float = 0.50,
 ) -> dict:
     """Calculate cleanliness for exactly the selected segmentation modules."""
     all_regions = discover_regions(segmentation_folder, segmentation_mode)
@@ -241,29 +302,44 @@ def calculate_selected_cleanliness(
             or (baseline_selected_faces is not None and not len(baseline_selected_faces))):
         raise RuntimeError("所选区域未映射到扫描模型，请检查模型配准和分割坐标")
 
-    before_raw = core.rgb_to_luminance(np.asarray(before_reg.mesh.vertex_colors))
-    after_raw = core.rgb_to_luminance(np.asarray(after_reg.mesh.vertex_colors))
+    colour_space = colour_space.casefold()
+    if colour_space not in COLOUR_SPACES:
+        raise ValueError("颜色空间必须是 rgb、hsv 或 lab")
+    # UI supplies a relative slider position. The actual divisor is selected
+    # inside the min/max signal range of the segmented cleaned model.
+    threshold_value = max(float(darkness_threshold), 0.0)
+    colour_domain_max = 360.0 if colour_space == "hsv" else 255.0
+    before_raw = colour_value(np.asarray(before_reg.mesh.vertex_colors), colour_space)
+    after_raw = colour_value(np.asarray(after_reg.mesh.vertex_colors), colour_space)
     before_vertices = np.unique(np.asarray(before_reg.mesh.triangles)[before_selected_faces])
     after_vertices = np.unique(np.asarray(after_reg.mesh.triangles)[after_selected_faces])
-    if baseline_reg is None:
+    if baseline_reg is None and colour_space == "rgb" and not threshold_enabled:
         before_lum, after_lum, exposure = core.normalise_luminance_pair(
             before_raw, after_raw, before_raw[before_vertices], after_raw[after_vertices]
         )
         baseline_metadata = {"enabled": False}
+    elif baseline_reg is None:
+        before_lum, after_lum = before_raw, after_raw
+        exposure = {"method": "fixed colour-space range [0,1]"}
+        baseline_metadata = {"enabled": False}
     else:
-        baseline_raw = core.rgb_to_luminance(
-            np.asarray(baseline_reg.mesh.vertex_colors)
+        baseline_raw = colour_value(
+            np.asarray(baseline_reg.mesh.vertex_colors), colour_space
         )
         if len(baseline_raw) != len(baseline_reg.mesh.vertices):
             raise ValueError("未染色原始牙模没有完整的顶点颜色，无法去除底色")
         baseline_vertices = np.unique(
             np.asarray(baseline_reg.mesh.triangles)[baseline_selected_faces]
         )
-        before_lum, after_lum, baseline_lum, exposure = _normalise_luminance_triplet(
-            before_raw, after_raw, baseline_raw,
-            before_raw[before_vertices], after_raw[after_vertices],
-            baseline_raw[baseline_vertices],
-        )
+        if colour_space == "rgb" and not threshold_enabled:
+            before_lum, after_lum, baseline_lum, exposure = _normalise_luminance_triplet(
+                before_raw, after_raw, baseline_raw,
+                before_raw[before_vertices], after_raw[after_vertices],
+                baseline_raw[baseline_vertices],
+            )
+        else:
+            before_lum, after_lum, baseline_lum = before_raw, after_raw, baseline_raw
+            exposure = {"method": "fixed colour-space range [0,1]"}
         baseline_metadata = {
             "enabled": True,
             "model": str(Path(baseline_model_path)),
@@ -273,6 +349,17 @@ def calculate_selected_cleanliness(
                 "inlier_rmse": baseline_reg.inlier_rmse,
             },
         }
+
+    before_lum = apply_darkness_threshold(
+        before_lum, threshold_enabled, threshold_value, colour_domain_max
+    )
+    after_lum = apply_darkness_threshold(
+        after_lum, threshold_enabled, threshold_value, colour_domain_max
+    )
+    if baseline_reg is not None:
+        baseline_lum = apply_darkness_threshold(
+            baseline_lum, threshold_enabled, threshold_value, colour_domain_max
+        )
 
     print("[3/4] 计算所选区域的真实三维面积颜色积分 ...")
     details = []
@@ -421,6 +508,11 @@ def calculate_selected_cleanliness(
     overall_score = float(np.clip(
         (1.0 - total_after / max(total_before, core.EPS)) * 100.0, -100.0, 100.0
     ))
+    threshold_preview_path = out / "threshold_preview_cleaned.ply"
+    o3d.io.write_triangle_mesh(
+        str(threshold_preview_path),
+        core.extract_face_mesh(after_reg.mesh, overall_af),
+    )
     report = {
         "method": (
             "independently segmented before/after/baseline models + subtraction "
@@ -439,6 +531,19 @@ def calculate_selected_cleanliness(
             "unclean_selected_darkness_integral) * 100"
         ),
         "exposure_normalisation": exposure,
+        "colour_space": colour_space,
+        "colour_space_description": {
+            "rgb": "IEC linear-luminance grayscale",
+            "hsv": "HSV H in fixed 0..360 domain",
+            "lab": "CIE Lab a* shifted to fixed 0..255 domain",
+        }[colour_space],
+        "threshold": {
+            "enabled": bool(threshold_enabled),
+            "value": threshold_value,
+            "domain": {"rgb": "0..255", "hsv": "H 0..360", "lab": "shifted a* 0..255"}[colour_space],
+            "method": "white_expanded = 1 - max((domain_max-raw_value)-threshold, 0)/domain_max",
+            "preview_mesh": str(threshold_preview_path),
+        },
         "baseline_removal": baseline_metadata,
         "max_label_distance": label_distance,
         "registration": {

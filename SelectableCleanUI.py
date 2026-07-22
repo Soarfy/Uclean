@@ -8,6 +8,8 @@ import sys
 import traceback
 from pathlib import Path
 
+import numpy as np
+
 from PyQt5.QtCore import Qt
 from PyQt5.QtCore import QProcess
 from PyQt5.QtGui import QColor, QFont
@@ -25,6 +27,8 @@ from PyQt5.QtWidgets import (
     QMainWindow,
     QMessageBox,
     QPushButton,
+    QSlider,
+    QSpinBox,
     QSplitter,
     QTableWidget,
     QTableWidgetItem,
@@ -72,6 +76,13 @@ class SelectableCleanlinessWindow(QMainWindow):
         self.regions = []
         self._region_actors = {}
         self._region_meshes = {}
+        self.threshold_preview_mesh = None
+        self.threshold_preview_rgb = None
+        self.threshold_exposure = None
+        self.threshold_confirmed = False
+        self.threshold_view_active = False
+        self.current_threshold_value = 9.0
+        self.current_signal_range = (0.0, 255.0)
         self._build_ui()
         self._reload_regions(show_errors=False)
 
@@ -218,6 +229,64 @@ class SelectableCleanlinessWindow(QMainWindow):
         splitter.setSizes([430, 800])
         layout.addWidget(splitter, 1)
 
+        analysis_options = QHBoxLayout()
+        self.colour_space_box = QCheckBox("颜色空间转换")
+        self.colour_space_combo = QComboBox()
+        self.colour_space_combo.addItem("RGB（当前线性灰度）", "rgb")
+        self.colour_space_combo.addItem("HSV（H 色相主值）", "hsv")
+        self.colour_space_combo.addItem("Lab（a* 红色轴主值）", "lab")
+        self.colour_space_combo.setEnabled(False)
+        self.colour_space_box.toggled.connect(self.colour_space_combo.setEnabled)
+        self.colour_space_box.toggled.connect(self._apply_threshold_preview)
+        self.colour_space_box.toggled.connect(self._colour_space_changed)
+        self.colour_space_combo.currentIndexChanged.connect(self._apply_threshold_preview)
+        self.colour_space_combo.currentIndexChanged.connect(self._colour_space_changed)
+        analysis_options.addWidget(self.colour_space_box)
+        analysis_options.addWidget(self.colour_space_combo)
+        self.threshold_box = QCheckBox("启用色域除数阈值")
+        self.threshold_box.setToolTip(
+            "先计算颜色值距白色的暗度，再减去阈值并转换回亮度；阈值越大越白"
+        )
+        self.threshold_slider = QSlider(Qt.Horizontal)
+        self.threshold_slider.setRange(0, 255)
+        self.threshold_slider.setValue(9)
+        self.threshold_slider.setFixedWidth(240)
+        self.threshold_slider.setEnabled(False)
+        self.threshold_value_label = QLabel("阈值 9（RGB范围0～255）")
+        self.threshold_box.toggled.connect(self.threshold_slider.setEnabled)
+        self.threshold_box.toggled.connect(self._apply_threshold_preview)
+        self.threshold_box.toggled.connect(self._threshold_toggled)
+        self.threshold_slider.valueChanged.connect(self._threshold_changed)
+        analysis_options.addSpacing(20)
+        analysis_options.addWidget(self.threshold_box)
+        self.threshold_minus_button = QPushButton("−")
+        self.threshold_minus_button.setFixedWidth(34)
+        self.threshold_minus_button.setEnabled(False)
+        self.threshold_minus_button.clicked.connect(lambda: self._adjust_threshold(-1))
+        analysis_options.addWidget(self.threshold_minus_button)
+        analysis_options.addWidget(self.threshold_slider)
+        self.threshold_plus_button = QPushButton("+")
+        self.threshold_plus_button.setFixedWidth(34)
+        self.threshold_plus_button.setEnabled(False)
+        self.threshold_plus_button.clicked.connect(lambda: self._adjust_threshold(1))
+        analysis_options.addWidget(self.threshold_plus_button)
+        analysis_options.addWidget(self.threshold_value_label)
+        analysis_options.addWidget(QLabel("步长"))
+        self.threshold_step_spin = QSpinBox()
+        self.threshold_step_spin.setRange(1, 100)
+        self.threshold_step_spin.setValue(1)
+        self.threshold_step_spin.setFixedWidth(68)
+        self.threshold_step_spin.setEnabled(False)
+        analysis_options.addWidget(self.threshold_step_spin)
+        self.confirm_threshold_button = QPushButton("确认当前阈值")
+        self.confirm_threshold_button.setEnabled(False)
+        self.confirm_threshold_button.clicked.connect(self._confirm_threshold)
+        analysis_options.addWidget(self.confirm_threshold_button)
+        self.threshold_confirm_label = QLabel("未启用")
+        analysis_options.addWidget(self.threshold_confirm_label)
+        analysis_options.addStretch(1)
+        layout.addLayout(analysis_options)
+
         options = QHBoxLayout()
         self.remove_baseline_box = QCheckBox("去除底色")
         self.remove_baseline_box.setToolTip(
@@ -264,11 +333,213 @@ class SelectableCleanlinessWindow(QMainWindow):
             )
         if selected:
             self.path_edits[key].setText(selected)
+            if key == "cleaned":
+                self.threshold_preview_mesh = None
+                self.threshold_preview_rgb = None
+                self.threshold_exposure = None
+                self.threshold_confirmed = False
+                if getattr(self, "threshold_box", None) is not None and self.threshold_box.isChecked():
+                    self._apply_threshold_preview()
             if key == "segments":
                 self._reload_regions()
 
     def _mode(self) -> str:
         return MODE_DATA[self.mode_combo.currentText()]
+
+    def _selected_colour_space(self) -> str:
+        if not self.colour_space_box.isChecked():
+            return "rgb"
+        return str(self.colour_space_combo.currentData())
+
+    def _colour_domain_max(self, space=None) -> int:
+        space = space or self._selected_colour_space()
+        return 360 if space == "hsv" else 255
+
+    def _threshold_changed(self, value: int) -> None:
+        self.threshold_value_label.setText(
+            f"阈值 {value}（范围0～{self._colour_domain_max()}）"
+        )
+        self.threshold_confirmed = False
+        self.threshold_confirm_label.setText("阈值已改变，尚未确认")
+        self.threshold_confirm_label.setStyleSheet("color:#d4380d;font-weight:bold;")
+        self._apply_threshold_preview()
+
+    def _adjust_threshold(self, direction: int) -> None:
+        step = self.threshold_step_spin.value()
+        self.threshold_slider.setValue(
+            self.threshold_slider.value() + int(direction) * step
+        )
+
+    def _colour_space_changed(self, _value=None) -> None:
+        domain_max = self._colour_domain_max()
+        old_value = self.threshold_slider.value()
+        self.threshold_slider.blockSignals(True)
+        self.threshold_slider.setRange(0, domain_max)
+        self.threshold_slider.setValue(min(old_value, domain_max))
+        self.threshold_slider.blockSignals(False)
+        self.threshold_value_label.setText(
+            f"阈值 {self.threshold_slider.value()}（范围0～{domain_max}）"
+        )
+        self._apply_threshold_preview()
+        if getattr(self, "threshold_box", None) is not None and self.threshold_box.isChecked():
+            self.threshold_confirmed = False
+            self.threshold_confirm_label.setText("颜色空间已改变，请重新确认")
+            self.threshold_confirm_label.setStyleSheet("color:#d4380d;font-weight:bold;")
+
+    def _threshold_toggled(self, enabled: bool) -> None:
+        self.threshold_minus_button.setEnabled(enabled)
+        self.threshold_plus_button.setEnabled(enabled)
+        self.threshold_step_spin.setEnabled(enabled)
+        self.confirm_threshold_button.setEnabled(enabled)
+        self.threshold_confirmed = not enabled
+        self.threshold_confirm_label.setText("等待确认" if enabled else "未启用")
+        self.threshold_confirm_label.setStyleSheet(
+            "color:#d48806;font-weight:bold;" if enabled else "color:#666;"
+        )
+
+    def _confirm_threshold(self) -> None:
+        self.threshold_confirmed = True
+        self.threshold_confirm_label.setText(
+            f"已确认阈值 {self.current_threshold_value:.0f}"
+        )
+        self.threshold_confirm_label.setStyleSheet("color:#389e0d;font-weight:bold;")
+        self.status_label.setText(
+            "阈值已确认，可以点击“开始计算所选区域清洁度”。"
+        )
+
+    def _load_threshold_preview(self, report: dict) -> None:
+        self.threshold_exposure = report.get("exposure_normalisation", {})
+        path = report.get("threshold", {}).get("preview_mesh", "")
+        if not path or not os.path.isfile(path) or pv is None:
+            self.threshold_preview_mesh = None
+            self.threshold_preview_rgb = None
+            return
+        mesh = pv.read(path)
+        if isinstance(mesh, pv.MultiBlock):
+            mesh = mesh.combine()
+        self._set_threshold_preview_mesh(mesh)
+        self._apply_threshold_preview()
+
+    def _set_threshold_preview_mesh(self, mesh) -> None:
+        self.threshold_preview_mesh = mesh.extract_surface().triangulate()
+        rgb = None
+        names = list(self.threshold_preview_mesh.point_data.keys())
+        names.sort(key=lambda name: (
+            name.casefold() not in {"rgb", "rgba", "color", "colors"},
+            "normal" in name.casefold(),
+        ))
+        for name in names:
+            values = np.asarray(self.threshold_preview_mesh.point_data[name])
+            if (values.ndim == 2 and values.shape[1] >= 3
+                    and "normal" not in name.casefold()):
+                rgb = values[:, :3].astype(np.float64)
+                break
+        if rgb is None:
+            rgb = np.full((self.threshold_preview_mesh.n_points, 3), 0.75)
+        elif rgb.max(initial=0.0) > 1.0:
+            rgb /= 255.0
+        self.threshold_preview_rgb = np.clip(rgb, 0.0, 1.0)
+
+    def _prepare_selected_threshold_preview(self) -> bool:
+        """Load the raw cleaned scan until a registered selected preview exists."""
+        if pv is None:
+            return False
+        cleaned_path = self.path_edits.get("cleaned")
+        cleaned_path = cleaned_path.text().strip() if cleaned_path is not None else ""
+        if not cleaned_path or not os.path.isfile(cleaned_path):
+            return False
+        try:
+            mesh = pv.read(cleaned_path)
+            if isinstance(mesh, pv.MultiBlock):
+                mesh = mesh.combine()
+            self.threshold_exposure = None
+            self._set_threshold_preview_mesh(mesh)
+            return True
+        except Exception as exc:
+            self.status_label.setText(f"阈值预览模型合并失败：{exc}")
+            return False
+
+    def _apply_threshold_preview(self, _value=None) -> None:
+        if getattr(self, "plotter", None) is None:
+            return
+        if not getattr(self, "threshold_box", None) or not self.threshold_box.isChecked():
+            if self.threshold_preview_mesh is not None:
+                self.threshold_view_active = False
+                self._region_actors.clear()
+                self.plotter.clear()
+                self.plotter.add_axes()
+                self._sync_embedded_preview(reset_camera=True)
+            return
+        if self.threshold_preview_mesh is None or self.threshold_preview_rgb is None:
+            if not self._prepare_selected_threshold_preview():
+                self.status_label.setText("请先选择有效的刷牙后模型。")
+                return
+        space = self._selected_colour_space()
+        values = backend.colour_value(self.threshold_preview_rgb, space)
+        if space == "rgb" and self.threshold_exposure:
+            low = self.threshold_exposure.get("luminance_p02")
+            high = self.threshold_exposure.get("luminance_p98")
+            if low is not None and high is not None and high > low:
+                values = np.clip((values - low) / (high - low), 0.0, 1.0)
+        domain_max = float(self._colour_domain_max(space))
+        raw_values = np.clip(values, 0.0, 1.0) * domain_max
+        threshold = float(self.threshold_slider.value())
+        self.current_signal_range = (0.0, domain_max)
+        self.current_threshold_value = threshold
+        self.threshold_value_label.setText(
+            f"阈值 {threshold:.0f}（{space.upper()}范围0～{domain_max:.0f}）"
+        )
+        raw_darkness = domain_max - raw_values
+        reduced_darkness = np.maximum(raw_darkness - threshold, 0.0)
+        normalised_darkness = np.clip(reduced_darkness / domain_max, 0.0, 1.0)
+        white_expanded = 1.0 - normalised_darkness
+        original = self.threshold_preview_mesh.copy()
+        processed = self.threshold_preview_mesh.copy()
+        original.point_data["original_rgb_display"] = np.clip(
+            self.threshold_preview_rgb * 255, 0, 255
+        ).astype(np.uint8)
+        processed.point_data["threshold_normalised"] = white_expanded
+        width = max(float(original.bounds[1] - original.bounds[0]), 1e-6)
+        gap = width * 1.18
+        original.translate((-gap / 2.0, 0.0, 0.0), inplace=True)
+        processed.translate((gap / 2.0, 0.0, 0.0), inplace=True)
+        preserve_camera = self.threshold_view_active
+        previous_camera = self.plotter.camera_position if preserve_camera else None
+        self._region_actors.clear()
+        self.plotter.clear()
+        self.plotter.add_axes()
+        self.plotter.add_mesh(
+            original, scalars="original_rgb_display", rgb=True,
+            name="threshold_original_rgb", smooth_shading=False, reset_camera=False,
+        )
+        self.plotter.add_mesh(
+            processed, scalars="threshold_normalised", cmap="gray", clim=(0.0, 1.0),
+            name="threshold_converted", smooth_shading=False, reset_camera=False,
+            scalar_bar_args={"title": "阈值处理后亮度"},
+        )
+        label_z = max(original.bounds[5], processed.bounds[5]) + max(
+            original.length, processed.length
+        ) * 0.04
+        label_points = np.array([
+            [original.center[0], original.center[1], label_z],
+            [processed.center[0], processed.center[1], label_z],
+        ])
+        self.plotter.add_point_labels(
+            label_points,
+            ["刷后原始 RGB", f"刷后 {space.upper()} + 阈值归一化"],
+            name="threshold_labels", point_size=0, font_size=15,
+            text_color="black", shape_color="white", always_visible=True,
+        )
+        if previous_camera is not None:
+            self.plotter.camera_position = previous_camera
+            self.plotter.render()
+        else:
+            self.plotter.reset_camera()
+        self.threshold_view_active = True
+        self.status_label.setText(
+            f"刷后模型双视图：左侧原始 RGB；右侧从距白色暗度中减去 "
+            f"{threshold:.0f} 并转换回亮度。阈值越大白色范围越明显；确认后才能计算。"
+        )
 
     def _update_formula_preview(self, remove_baseline: bool) -> None:
         if remove_baseline:
@@ -333,6 +604,13 @@ class SelectableCleanlinessWindow(QMainWindow):
         selected = len(self._selected_names())
         mode_name = self.mode_combo.currentText()
         self.region_summary.setText(f"{mode_name}：共 {total} 个模块，已选择 {selected} 个")
+        if getattr(self, "threshold_box", None) is not None and self.threshold_box.isChecked():
+            self.threshold_preview_mesh = None
+            self.threshold_preview_rgb = None
+            self.threshold_confirmed = False
+            self.threshold_confirm_label.setText("分区已改变，请重新确认阈值")
+            self._apply_threshold_preview()
+            return
         self._sync_embedded_preview()
 
     def _set_all_checked(self, checked: bool) -> None:
@@ -455,6 +733,20 @@ class SelectableCleanlinessWindow(QMainWindow):
             self.formula_label.setText(
                 "原始模式公式：清洁度 = (1 − 刷后污渍积分 ÷ max(刷前污渍积分, ε)) × 100%。"
             )
+        colour_text = {
+            "rgb": "RGB：使用现有线性灰度暗度 1−Y",
+            "hsv": "HSV：使用归一化 H 色相作为污渍信号",
+            "lab": "Lab：使用正向 a*（红色轴）作为污渍信号",
+        }[self._selected_colour_space()]
+        threshold_text = (
+            f"；色域范围0～{self.current_signal_range[1]:.0f}，"
+            f"当前阈值 {self.current_threshold_value:.0f}；"
+            "新亮度 = 1 − max((色域最大值−原值)−当前阈值, 0) ÷ 色域最大值"
+            if self.threshold_box.isChecked() else "；阈值：未启用"
+        )
+        self.formula_label.setText(
+            self.formula_label.text() + "\n颜色分解：" + colour_text + threshold_text
+        )
         self.table.setColumnCount(len(headers))
         self.table.setHorizontalHeaderLabels(headers)
         score_column = len(headers) - 1
@@ -571,6 +863,12 @@ class SelectableCleanlinessWindow(QMainWindow):
         if backend is None:
             QMessageBox.critical(self, "后端加载失败", BACKEND_IMPORT_ERROR)
             return
+        if self.threshold_box.isChecked() and not self.threshold_confirmed:
+            QMessageBox.warning(
+                self, "阈值尚未确认",
+                "请先拖动滑块查看实时效果，然后点击“确认当前阈值”，再进行清洁度计算。",
+            )
+            return
         try:
             paths = self._validate_paths()
         except Exception as exc:
@@ -594,7 +892,11 @@ class SelectableCleanlinessWindow(QMainWindow):
                 show_point_cloud_comparison=self.show_gray_box.isChecked(),
                 save_intermediate_results=self.save_intermediate_box.isChecked(),
                 remove_baseline=self.remove_baseline_box.isChecked(),
+                colour_space=self._selected_colour_space(),
+                threshold_enabled=self.threshold_box.isChecked(),
+                darkness_threshold=float(self.threshold_slider.value()),
             )
+            self._load_threshold_preview(report)
             self._render_report(report)
             score = float(report.get("overall_cleanliness", 0.0))
             method_name = "已去除底色" if self.remove_baseline_box.isChecked() else "原始颜色"

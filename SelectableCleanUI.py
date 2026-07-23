@@ -78,6 +78,9 @@ class SelectableCleanlinessWindow(QMainWindow):
         self._region_meshes = {}
         self.threshold_preview_mesh = None
         self.threshold_preview_rgb = None
+        self.threshold_model_names = []
+        self.threshold_model_centers = []
+        self.threshold_single_model_width = 1.0
         self.threshold_exposure = None
         self.threshold_confirmed = False
         self.threshold_view_active = False
@@ -245,7 +248,7 @@ class SelectableCleanlinessWindow(QMainWindow):
         analysis_options.addWidget(self.colour_space_combo)
         self.threshold_box = QCheckBox("启用色域除数阈值")
         self.threshold_box.setToolTip(
-            "先计算颜色值距白色的暗度，再减去阈值并转换回亮度；阈值越大越白"
+            "滑块范围来自分割模型实际暗度；低于阈值显示淡红蒙版，确认后减阈值并截断到0"
         )
         self.threshold_slider = QSlider(Qt.Horizontal)
         self.threshold_slider.setRange(0, 255)
@@ -406,19 +409,52 @@ class SelectableCleanlinessWindow(QMainWindow):
         self.status_label.setText(
             "阈值已确认，可以点击“开始计算所选区域清洁度”。"
         )
+        self._apply_threshold_preview()
 
     def _load_threshold_preview(self, report: dict) -> None:
         self.threshold_exposure = report.get("exposure_normalisation", {})
-        path = report.get("threshold", {}).get("preview_mesh", "")
-        if not path or not os.path.isfile(path) or pv is None:
+        paths = report.get("threshold", {}).get("preview_meshes", {})
+        if not paths:
+            path = report.get("threshold", {}).get("preview_mesh", "")
+            paths = {"刷牙后": path} if path else {}
+        baseline_edit = self.path_edits.get("baseline")
+        baseline_path = baseline_edit.text().strip() if baseline_edit is not None else ""
+        if "未染色" not in paths and baseline_path and os.path.isfile(baseline_path):
+            paths["未染色"] = baseline_path
+        if not paths or pv is None:
             self.threshold_preview_mesh = None
             self.threshold_preview_rgb = None
             return
-        mesh = pv.read(path)
-        if isinstance(mesh, pv.MultiBlock):
-            mesh = mesh.combine()
-        self._set_threshold_preview_mesh(mesh)
+        models = {}
+        for name, path in paths.items():
+            if os.path.isfile(path):
+                mesh = pv.read(path)
+                models[name] = mesh.combine() if isinstance(mesh, pv.MultiBlock) else mesh
+        if not models:
+            return
+        self._combine_threshold_models(models)
         self._apply_threshold_preview()
+
+    def _combine_threshold_models(self, models: dict) -> None:
+        blocks = []
+        self.threshold_model_names = list(models.keys())
+        max_width = max(
+            max(float(mesh.bounds[1] - mesh.bounds[0]), 1e-6)
+            for mesh in models.values()
+        )
+        self.threshold_single_model_width = max_width
+        # Each anatomical group contains two side-by-side models, so reserve
+        # enough horizontal room before placing the next group.
+        spacing = max_width * 2.55
+        self.threshold_model_centers = []
+        count = len(models)
+        for index, mesh in enumerate(models.values()):
+            block = mesh.extract_surface().triangulate().copy()
+            x_offset = (index - (count - 1) / 2.0) * spacing
+            block.translate((x_offset, 0.0, 0.0), inplace=True)
+            self.threshold_model_centers.append(np.asarray(block.center, dtype=float))
+            blocks.append(block)
+        self._set_threshold_preview_mesh(pv.MultiBlock(blocks).combine())
 
     def _set_threshold_preview_mesh(self, mesh) -> None:
         self.threshold_preview_mesh = mesh.extract_surface().triangulate()
@@ -444,16 +480,19 @@ class SelectableCleanlinessWindow(QMainWindow):
         """Load the raw cleaned scan until a registered selected preview exists."""
         if pv is None:
             return False
-        cleaned_path = self.path_edits.get("cleaned")
-        cleaned_path = cleaned_path.text().strip() if cleaned_path is not None else ""
-        if not cleaned_path or not os.path.isfile(cleaned_path):
-            return False
         try:
-            mesh = pv.read(cleaned_path)
-            if isinstance(mesh, pv.MultiBlock):
-                mesh = mesh.combine()
+            models = {}
+            for key, name in (("unclean", "刷牙前"), ("cleaned", "刷牙后"),
+                              ("baseline", "未染色")):
+                edit = self.path_edits.get(key)
+                path = edit.text().strip() if edit is not None else ""
+                if path and os.path.isfile(path):
+                    mesh = pv.read(path)
+                    models[name] = mesh.combine() if isinstance(mesh, pv.MultiBlock) else mesh
+            if not models:
+                return False
             self.threshold_exposure = None
-            self._set_threshold_preview_mesh(mesh)
+            self._combine_threshold_models(models)
             return True
         except Exception as exc:
             self.status_label.setText(f"阈值预览模型合并失败：{exc}")
@@ -483,24 +522,47 @@ class SelectableCleanlinessWindow(QMainWindow):
                 values = np.clip((values - low) / (high - low), 0.0, 1.0)
         domain_max = float(self._colour_domain_max(space))
         raw_values = np.clip(values, 0.0, 1.0) * domain_max
+        raw_darkness = domain_max - raw_values
+        signal_min = float(raw_darkness.min())
+        signal_max = float(raw_darkness.max())
+        slider_min = max(0, int(np.floor(signal_min)))
+        slider_max = min(int(domain_max), max(slider_min, int(np.ceil(signal_max))))
+        old_threshold = self.threshold_slider.value()
+        self.threshold_slider.blockSignals(True)
+        self.threshold_slider.setRange(slider_min, slider_max)
+        self.threshold_slider.setValue(int(np.clip(old_threshold, slider_min, slider_max)))
+        self.threshold_slider.blockSignals(False)
         threshold = float(self.threshold_slider.value())
-        self.current_signal_range = (0.0, domain_max)
+        self.current_signal_range = (signal_min, signal_max)
         self.current_threshold_value = threshold
         self.threshold_value_label.setText(
-            f"阈值 {threshold:.0f}（{space.upper()}范围0～{domain_max:.0f}）"
+            f"阈值 {threshold:.0f}（模型范围{signal_min:.2f}～{signal_max:.2f}）"
         )
-        raw_darkness = domain_max - raw_values
-        reduced_darkness = np.maximum(raw_darkness - threshold, 0.0)
-        normalised_darkness = np.clip(reduced_darkness / domain_max, 0.0, 1.0)
-        white_expanded = 1.0 - normalised_darkness
+        below_threshold = raw_darkness < threshold
         original = self.threshold_preview_mesh.copy()
         processed = self.threshold_preview_mesh.copy()
         original.point_data["original_rgb_display"] = np.clip(
             self.threshold_preview_rgb * 255, 0, 255
         ).astype(np.uint8)
-        processed.point_data["threshold_normalised"] = white_expanded
-        width = max(float(original.bounds[1] - original.bounds[0]), 1e-6)
-        gap = width * 1.18
+        if self.threshold_confirmed:
+            adjusted_darkness = np.where(
+                below_threshold,
+                np.maximum(raw_darkness - threshold, 0.0),
+                raw_darkness,
+            )
+            adjusted_brightness = 1.0 - np.clip(
+                adjusted_darkness / domain_max, 0.0, 1.0
+            )
+            display_gray = np.clip(adjusted_brightness * 255, 0, 255).astype(np.uint8)
+            processed_colours = np.repeat(display_gray[:, None], 3, axis=1)
+            processed_label = f"刷后 {space.upper()} 确认后的新颜色"
+        else:
+            channel_display = np.clip(values * 255, 0, 255).astype(np.uint8)
+            processed_colours = np.repeat(channel_display[:, None], 3, axis=1)
+            processed_colours[below_threshold] = np.array([255, 190, 190], dtype=np.uint8)
+            processed_label = f"刷后 {space.upper()} 阈值蒙版"
+        processed.point_data["threshold_mask_rgb"] = processed_colours
+        gap = max(float(self.threshold_single_model_width), 1e-6) * 1.12
         original.translate((-gap / 2.0, 0.0, 0.0), inplace=True)
         processed.translate((gap / 2.0, 0.0, 0.0), inplace=True)
         preserve_camera = self.threshold_view_active
@@ -513,20 +575,27 @@ class SelectableCleanlinessWindow(QMainWindow):
             name="threshold_original_rgb", smooth_shading=False, reset_camera=False,
         )
         self.plotter.add_mesh(
-            processed, scalars="threshold_normalised", cmap="gray", clim=(0.0, 1.0),
+            processed, scalars="threshold_mask_rgb", rgb=True,
             name="threshold_converted", smooth_shading=False, reset_camera=False,
-            scalar_bar_args={"title": "阈值处理后亮度"},
         )
         label_z = max(original.bounds[5], processed.bounds[5]) + max(
             original.length, processed.length
         ) * 0.04
-        label_points = np.array([
-            [original.center[0], original.center[1], label_z],
-            [processed.center[0], processed.center[1], label_z],
-        ])
+        label_points = []
+        label_texts = []
+        for name, center in zip(self.threshold_model_names, self.threshold_model_centers):
+            label_points.append([center[0] - gap / 2.0, center[1], label_z])
+            label_texts.append(f"{name} 原始RGB")
+            label_points.append([center[0] + gap / 2.0, center[1], label_z])
+            label_texts.append(f"{name} {space.upper()}效果")
+        if not label_points:
+            label_points = [
+                [original.center[0], original.center[1], label_z],
+                [processed.center[0], processed.center[1], label_z],
+            ]
+            label_texts = ["原始 RGB", processed_label]
         self.plotter.add_point_labels(
-            label_points,
-            ["刷后原始 RGB", f"刷后 {space.upper()} + 阈值归一化"],
+            np.asarray(label_points), label_texts,
             name="threshold_labels", point_size=0, font_size=15,
             text_color="black", shape_color="white", always_visible=True,
         )
@@ -536,10 +605,17 @@ class SelectableCleanlinessWindow(QMainWindow):
         else:
             self.plotter.reset_camera()
         self.threshold_view_active = True
-        self.status_label.setText(
-            f"刷后模型双视图：左侧原始 RGB；右侧从距白色暗度中减去 "
-            f"{threshold:.0f} 并转换回亮度。阈值越大白色范围越明显；确认后才能计算。"
-        )
+        if self.threshold_confirmed:
+            self.status_label.setText(
+                f"已确认阈值 {threshold:.0f}：右侧正在显示处理后的新颜色；"
+                f"低于阈值的 {int(below_threshold.sum()):,} 个顶点已减阈值并截断到白色。"
+            )
+        else:
+            self.status_label.setText(
+                f"刷后模型双视图：暗度范围 {signal_min:.2f}～{signal_max:.2f}，"
+                f"低于阈值 {threshold:.0f} 的 {int(below_threshold.sum()):,} 个顶点显示淡红蒙版；"
+                f"其余显示 {space.upper()} 通道灰度。确认后才能计算。"
+            )
 
     def _update_formula_preview(self, remove_baseline: bool) -> None:
         if remove_baseline:
@@ -739,9 +815,9 @@ class SelectableCleanlinessWindow(QMainWindow):
             "lab": "Lab：使用正向 a*（红色轴）作为污渍信号",
         }[self._selected_colour_space()]
         threshold_text = (
-            f"；色域范围0～{self.current_signal_range[1]:.0f}，"
+            f"；模型暗度范围{self.current_signal_range[0]:.2f}～{self.current_signal_range[1]:.2f}，"
             f"当前阈值 {self.current_threshold_value:.0f}；"
-            "新亮度 = 1 − max((色域最大值−原值)−当前阈值, 0) ÷ 色域最大值"
+            "暗度<阈值时：新暗度=max(原暗度−阈值,0)；暗度≥阈值时保持原暗度"
             if self.threshold_box.isChecked() else "；阈值：未启用"
         )
         self.formula_label.setText(

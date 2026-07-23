@@ -192,13 +192,16 @@ def apply_darkness_threshold(values: np.ndarray, enabled: bool,
                              threshold: float, domain_max: float) -> np.ndarray:
     if not enabled:
         return values
-    # Subtract an offset from darkness, then convert back to brightness.
-    # In raw-domain units: darkness' = max(darkness - threshold, 0).
-    darkness = 1.0 - np.clip(values, 0.0, 1.0)
-    reduced_darkness = np.clip(
-        darkness - float(threshold) / max(float(domain_max), core.EPS), 0.0, 1.0
+    raw_darkness = (1.0 - np.clip(values, 0.0, 1.0)) * float(domain_max)
+    # Values below the confirmed threshold are reduced by it. Since that
+    # result is negative, clamp to white (darkness 0). Values at/above the
+    # threshold remain unchanged, exactly matching the interactive mask.
+    adjusted = np.where(
+        raw_darkness < float(threshold),
+        np.maximum(raw_darkness - float(threshold), 0.0),
+        raw_darkness,
     )
-    return 1.0 - reduced_darkness
+    return 1.0 - np.clip(adjusted / max(float(domain_max), core.EPS), 0.0, 1.0)
 
 
 def _subtract_baseline_integral(scan_stats: dict, baseline_stats: dict) -> dict:
@@ -305,9 +308,6 @@ def calculate_selected_cleanliness(
     colour_space = colour_space.casefold()
     if colour_space not in COLOUR_SPACES:
         raise ValueError("颜色空间必须是 rgb、hsv 或 lab")
-    # UI supplies a relative slider position. The actual divisor is selected
-    # inside the min/max signal range of the segmented cleaned model.
-    threshold_value = max(float(darkness_threshold), 0.0)
     colour_domain_max = 360.0 if colour_space == "hsv" else 255.0
     before_raw = colour_value(np.asarray(before_reg.mesh.vertex_colors), colour_space)
     after_raw = colour_value(np.asarray(after_reg.mesh.vertex_colors), colour_space)
@@ -349,6 +349,22 @@ def calculate_selected_cleanliness(
                 "inlier_rmse": baseline_reg.inlier_rmse,
             },
         }
+
+    # ``after_lum`` must exist before deriving the segmented cleaned-model
+    # darkness range used by the threshold slider/calculation.
+    threshold_signals = [
+        (1.0 - np.clip(before_lum[before_vertices], 0.0, 1.0)) * colour_domain_max,
+        (1.0 - np.clip(after_lum[after_vertices], 0.0, 1.0)) * colour_domain_max,
+    ]
+    if baseline_reg is not None:
+        threshold_signals.append(
+            (1.0 - np.clip(baseline_lum[baseline_vertices], 0.0, 1.0))
+            * colour_domain_max
+        )
+    combined_threshold_signal = np.concatenate(threshold_signals)
+    signal_min = float(combined_threshold_signal.min())
+    signal_max = float(combined_threshold_signal.max())
+    threshold_value = float(np.clip(darkness_threshold, signal_min, signal_max))
 
     before_lum = apply_darkness_threshold(
         before_lum, threshold_enabled, threshold_value, colour_domain_max
@@ -509,10 +525,26 @@ def calculate_selected_cleanliness(
         (1.0 - total_after / max(total_before, core.EPS)) * 100.0, -100.0, 100.0
     ))
     threshold_preview_path = out / "threshold_preview_cleaned.ply"
+    threshold_preview_before_path = out / "threshold_preview_unclean.ply"
     o3d.io.write_triangle_mesh(
         str(threshold_preview_path),
         core.extract_face_mesh(after_reg.mesh, overall_af),
     )
+    o3d.io.write_triangle_mesh(
+        str(threshold_preview_before_path),
+        core.extract_face_mesh(before_reg.mesh, overall_bf),
+    )
+    threshold_preview_paths = {
+        "刷牙前": str(threshold_preview_before_path),
+        "刷牙后": str(threshold_preview_path),
+    }
+    if overall_base is not None:
+        threshold_preview_baseline_path = out / "threshold_preview_baseline.ply"
+        o3d.io.write_triangle_mesh(
+            str(threshold_preview_baseline_path),
+            core.extract_face_mesh(baseline_reg.mesh, overall_basef),
+        )
+        threshold_preview_paths["未染色"] = str(threshold_preview_baseline_path)
     report = {
         "method": (
             "independently segmented before/after/baseline models + subtraction "
@@ -540,9 +572,12 @@ def calculate_selected_cleanliness(
         "threshold": {
             "enabled": bool(threshold_enabled),
             "value": threshold_value,
+            "signal_min": signal_min,
+            "signal_max": signal_max,
             "domain": {"rgb": "0..255", "hsv": "H 0..360", "lab": "shifted a* 0..255"}[colour_space],
-            "method": "white_expanded = 1 - max((domain_max-raw_value)-threshold, 0)/domain_max",
+            "method": "if raw_darkness < threshold: adjusted=max(raw_darkness-threshold,0); else adjusted=raw_darkness",
             "preview_mesh": str(threshold_preview_path),
+            "preview_meshes": threshold_preview_paths,
         },
         "baseline_removal": baseline_metadata,
         "max_label_distance": label_distance,

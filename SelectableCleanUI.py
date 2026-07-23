@@ -30,6 +30,7 @@ from PyQt5.QtWidgets import (
     QSlider,
     QSpinBox,
     QSplitter,
+    QTabWidget,
     QTableWidget,
     QTableWidgetItem,
     QVBoxLayout,
@@ -95,9 +96,35 @@ class SelectableCleanlinessWindow(QMainWindow):
         self.setMinimumSize(1500, 920)
         root = QWidget(self)
         self.setCentralWidget(root)
-        layout = QVBoxLayout(root)
+        root_layout = QVBoxLayout(root)
+        root_layout.setContentsMargins(8, 8, 8, 8)
+        self.tabs = QTabWidget()
+        self.main_tab = QWidget()
+        self.threshold_tab = QWidget()
+        self.tabs.addTab(self.main_tab, "分区选择与清洁度")
+        self.tabs.addTab(self.threshold_tab, "三模型阈值交互")
+        root_layout.addWidget(self.tabs)
+        layout = QVBoxLayout(self.main_tab)
         layout.setContentsMargins(16, 16, 16, 16)
         layout.setSpacing(9)
+        threshold_layout = QVBoxLayout(self.threshold_tab)
+        threshold_layout.setContentsMargins(12, 12, 12, 12)
+        threshold_title = QLabel(
+            "刷牙前 / 刷牙后 / 未染色模型阈值对比（每组：原始RGB | 阈值效果）"
+        )
+        threshold_title.setFont(QFont("Microsoft YaHei", 12, QFont.Bold))
+        threshold_layout.addWidget(threshold_title)
+        if QtInteractor is not None:
+            self.threshold_plotter = QtInteractor(self.threshold_tab)
+            self.threshold_plotter.set_background("white")
+            self.threshold_plotter.add_axes()
+            self.threshold_plotter.enable_anti_aliasing()
+            threshold_layout.addWidget(self.threshold_plotter.interactor, 1)
+        else:
+            self.threshold_plotter = None
+            threshold_error = QLabel("无法加载阈值3D视图。\n" + VIEWER_IMPORT_ERROR)
+            threshold_error.setWordWrap(True)
+            threshold_layout.addWidget(threshold_error, 1)
 
         title = QLabel("牙模清洁度分析（标准大区域 / 详细细分区域可选）")
         title.setFont(QFont("Microsoft YaHei", 16, QFont.Bold))
@@ -259,6 +286,9 @@ class SelectableCleanlinessWindow(QMainWindow):
         self.threshold_box.toggled.connect(self.threshold_slider.setEnabled)
         self.threshold_box.toggled.connect(self._apply_threshold_preview)
         self.threshold_box.toggled.connect(self._threshold_toggled)
+        self.threshold_box.toggled.connect(
+            lambda enabled: self.tabs.setCurrentWidget(self.threshold_tab) if enabled else None
+        )
         self.threshold_slider.valueChanged.connect(self._threshold_changed)
         analysis_options.addSpacing(20)
         analysis_options.addWidget(self.threshold_box)
@@ -288,7 +318,10 @@ class SelectableCleanlinessWindow(QMainWindow):
         self.threshold_confirm_label = QLabel("未启用")
         analysis_options.addWidget(self.threshold_confirm_label)
         analysis_options.addStretch(1)
-        layout.addLayout(analysis_options)
+        threshold_layout.addLayout(analysis_options)
+        self.threshold_status_label = QLabel("启用阈值后，可在此页同时查看刷前、刷后和未染色模型。")
+        self.threshold_status_label.setWordWrap(True)
+        threshold_layout.addWidget(self.threshold_status_label)
 
         options = QHBoxLayout()
         self.remove_baseline_box = QCheckBox("去除底色")
@@ -409,6 +442,9 @@ class SelectableCleanlinessWindow(QMainWindow):
         self.status_label.setText(
             "阈值已确认，可以点击“开始计算所选区域清洁度”。"
         )
+        self.threshold_status_label.setText(
+            "阈值已确认，可以返回主界面点击“开始计算所选区域清洁度”。"
+        )
         self._apply_threshold_preview()
 
     def _load_threshold_preview(self, report: dict) -> None:
@@ -499,15 +535,15 @@ class SelectableCleanlinessWindow(QMainWindow):
             return False
 
     def _apply_threshold_preview(self, _value=None) -> None:
-        if getattr(self, "plotter", None) is None:
+        preview_plotter = getattr(self, "threshold_plotter", None)
+        if preview_plotter is None:
             return
         if not getattr(self, "threshold_box", None) or not self.threshold_box.isChecked():
             if self.threshold_preview_mesh is not None:
                 self.threshold_view_active = False
-                self._region_actors.clear()
-                self.plotter.clear()
-                self.plotter.add_axes()
-                self._sync_embedded_preview(reset_camera=True)
+                preview_plotter.clear()
+                preview_plotter.add_axes()
+                preview_plotter.render()
             return
         if self.threshold_preview_mesh is None or self.threshold_preview_rgb is None:
             if not self._prepare_selected_threshold_preview():
@@ -566,15 +602,14 @@ class SelectableCleanlinessWindow(QMainWindow):
         original.translate((-gap / 2.0, 0.0, 0.0), inplace=True)
         processed.translate((gap / 2.0, 0.0, 0.0), inplace=True)
         preserve_camera = self.threshold_view_active
-        previous_camera = self.plotter.camera_position if preserve_camera else None
-        self._region_actors.clear()
-        self.plotter.clear()
-        self.plotter.add_axes()
-        self.plotter.add_mesh(
+        previous_camera = preview_plotter.camera_position if preserve_camera else None
+        preview_plotter.clear()
+        preview_plotter.add_axes()
+        preview_plotter.add_mesh(
             original, scalars="original_rgb_display", rgb=True,
             name="threshold_original_rgb", smooth_shading=False, reset_camera=False,
         )
-        self.plotter.add_mesh(
+        preview_plotter.add_mesh(
             processed, scalars="threshold_mask_rgb", rgb=True,
             name="threshold_converted", smooth_shading=False, reset_camera=False,
         )
@@ -594,28 +629,30 @@ class SelectableCleanlinessWindow(QMainWindow):
                 [processed.center[0], processed.center[1], label_z],
             ]
             label_texts = ["原始 RGB", processed_label]
-        self.plotter.add_point_labels(
+        preview_plotter.add_point_labels(
             np.asarray(label_points), label_texts,
             name="threshold_labels", point_size=0, font_size=15,
             text_color="black", shape_color="white", always_visible=True,
         )
         if previous_camera is not None:
-            self.plotter.camera_position = previous_camera
-            self.plotter.render()
+            preview_plotter.camera_position = previous_camera
+            preview_plotter.render()
         else:
-            self.plotter.reset_camera()
+            preview_plotter.reset_camera()
         self.threshold_view_active = True
         if self.threshold_confirmed:
-            self.status_label.setText(
+            status_text = (
                 f"已确认阈值 {threshold:.0f}：右侧正在显示处理后的新颜色；"
                 f"低于阈值的 {int(below_threshold.sum()):,} 个顶点已减阈值并截断到白色。"
             )
         else:
-            self.status_label.setText(
+            status_text = (
                 f"刷后模型双视图：暗度范围 {signal_min:.2f}～{signal_max:.2f}，"
                 f"低于阈值 {threshold:.0f} 的 {int(below_threshold.sum()):,} 个顶点显示淡红蒙版；"
                 f"其余显示 {space.upper()} 通道灰度。确认后才能计算。"
             )
+        self.status_label.setText(status_text)
+        self.threshold_status_label.setText(status_text)
 
     def _update_formula_preview(self, remove_baseline: bool) -> None:
         if remove_baseline:

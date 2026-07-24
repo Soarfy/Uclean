@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import os
+import csv
 import sys
 import traceback
 from pathlib import Path
@@ -72,7 +73,15 @@ GROUP_DISPLAY_ORDER = (
 class SelectableCleanlinessWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
-        self.project_dir = Path(__file__).resolve().parent
+        self.frozen = bool(getattr(sys, "frozen", False))
+        self.project_dir = (
+            Path(sys.executable).resolve().parent
+            if self.frozen
+            else Path(__file__).resolve().parent
+        )
+        self.resource_dir = Path(
+            getattr(sys, "_MEIPASS", Path(__file__).resolve().parent)
+        )
         self.path_edits: dict[str, QLineEdit] = {}
         self.regions = []
         self._region_actors = {}
@@ -130,12 +139,26 @@ class SelectableCleanlinessWindow(QMainWindow):
         title.setFont(QFont("Microsoft YaHei", 16, QFont.Bold))
         layout.addWidget(title)
 
+        processing_row = QHBoxLayout()
+        processing_row.addWidget(QLabel("处理模式："))
+        self.processing_mode_combo = QComboBox()
+        self.processing_mode_combo.addItem("单个文件处理", "single")
+        self.processing_mode_combo.addItem("文件夹批量处理", "folder")
+        self.processing_mode_combo.currentIndexChanged.connect(self._processing_mode_changed)
+        processing_row.addWidget(self.processing_mode_combo)
+        self.processing_mode_hint = QLabel("选择一个刷牙后牙模并计算。")
+        self.processing_mode_hint.setStyleSheet("color:#666;")
+        processing_row.addWidget(self.processing_mode_hint)
+        processing_row.addStretch(1)
+        layout.addLayout(processing_row)
+
         defaults = {
-            "standard": self.project_dir / "pointsdata" / "LowerJawScans.ply",
-            "baseline": self.project_dir / "pointsdata" / "原始牙模 LowerJawScan.ply",
-            "unclean": self.project_dir / "pointsdata" / "UncleanLowerJawScan.ply",
-            "cleaned": self.project_dir / "pointsdata" / "IO9-3 LowerJawScan.ply",
-            "segments": self.project_dir / "segmentationfolder",
+            "standard": self.resource_dir / "pointsdata" / "LowerJawScans.ply",
+            "baseline": self.resource_dir / "pointsdata" / "原始牙模 LowerJawScan.ply",
+            "unclean": self.resource_dir / "pointsdata" / "UncleanLowerJawScan.ply",
+            "cleaned": self.resource_dir / "pointsdata" / "IO9-3 LowerJawScan.ply",
+            "cleaned_folder": self.project_dir / "cleaned_models",
+            "segments": self.resource_dir / "segmentationfolder",
             "output": self.project_dir / "selectable_cleanliness_results",
         }
         rows = (
@@ -143,6 +166,7 @@ class SelectableCleanlinessWindow(QMainWindow):
             ("未染色原始牙模", "baseline", False),
             ("刷牙前模型", "unclean", False),
             ("刷牙后模型", "cleaned", False),
+            ("刷牙后模型文件夹", "cleaned_folder", True),
             ("分割方案文件夹", "segments", True),
             ("结果输出文件夹", "output", True),
         )
@@ -157,10 +181,14 @@ class SelectableCleanlinessWindow(QMainWindow):
                 lambda _checked=False, k=key, d=is_directory: self._choose_path(k, d)
             )
             self.path_edits[key] = edit
+            if key in {"cleaned", "cleaned_folder"}:
+                self.cleaned_path_rows = getattr(self, "cleaned_path_rows", {})
+                self.cleaned_path_rows[key] = (caption, edit, button)
             row.addWidget(caption)
             row.addWidget(edit, 1)
             row.addWidget(button)
             layout.addLayout(row)
+        self._processing_mode_changed()
 
         mode_row = QHBoxLayout()
         mode_row.addWidget(QLabel("分割模式："))
@@ -259,7 +287,7 @@ class SelectableCleanlinessWindow(QMainWindow):
         splitter.setSizes([430, 800])
         layout.addWidget(splitter, 1)
 
-        analysis_options = QHBoxLayout()
+        threshold_entry_options = QHBoxLayout()
         self.colour_space_box = QCheckBox("颜色空间转换")
         self.colour_space_combo = QComboBox()
         self.colour_space_combo.addItem("RGB（当前线性灰度）", "rgb")
@@ -271,8 +299,8 @@ class SelectableCleanlinessWindow(QMainWindow):
         self.colour_space_box.toggled.connect(self._colour_space_changed)
         self.colour_space_combo.currentIndexChanged.connect(self._apply_threshold_preview)
         self.colour_space_combo.currentIndexChanged.connect(self._colour_space_changed)
-        analysis_options.addWidget(self.colour_space_box)
-        analysis_options.addWidget(self.colour_space_combo)
+        threshold_entry_options.addWidget(self.colour_space_box)
+        threshold_entry_options.addWidget(self.colour_space_combo)
         self.threshold_box = QCheckBox("启用色域除数阈值")
         self.threshold_box.setToolTip(
             "滑块范围来自分割模型实际暗度；低于阈值显示淡红蒙版，确认后减阈值并截断到0"
@@ -290,35 +318,40 @@ class SelectableCleanlinessWindow(QMainWindow):
             lambda enabled: self.tabs.setCurrentWidget(self.threshold_tab) if enabled else None
         )
         self.threshold_slider.valueChanged.connect(self._threshold_changed)
-        analysis_options.addSpacing(20)
-        analysis_options.addWidget(self.threshold_box)
+        threshold_entry_options.addSpacing(20)
+        threshold_entry_options.addWidget(self.threshold_box)
+        threshold_entry_options.addWidget(QLabel("勾选后自动进入第二页调整，确认后返回本页"))
+        threshold_entry_options.addStretch(1)
+        layout.addLayout(threshold_entry_options)
+
+        threshold_controls = QHBoxLayout()
         self.threshold_minus_button = QPushButton("−")
         self.threshold_minus_button.setFixedWidth(34)
         self.threshold_minus_button.setEnabled(False)
         self.threshold_minus_button.clicked.connect(lambda: self._adjust_threshold(-1))
-        analysis_options.addWidget(self.threshold_minus_button)
-        analysis_options.addWidget(self.threshold_slider)
+        threshold_controls.addWidget(self.threshold_minus_button)
+        threshold_controls.addWidget(self.threshold_slider)
         self.threshold_plus_button = QPushButton("+")
         self.threshold_plus_button.setFixedWidth(34)
         self.threshold_plus_button.setEnabled(False)
         self.threshold_plus_button.clicked.connect(lambda: self._adjust_threshold(1))
-        analysis_options.addWidget(self.threshold_plus_button)
-        analysis_options.addWidget(self.threshold_value_label)
-        analysis_options.addWidget(QLabel("步长"))
+        threshold_controls.addWidget(self.threshold_plus_button)
+        threshold_controls.addWidget(self.threshold_value_label)
+        threshold_controls.addWidget(QLabel("步长"))
         self.threshold_step_spin = QSpinBox()
         self.threshold_step_spin.setRange(1, 100)
         self.threshold_step_spin.setValue(1)
         self.threshold_step_spin.setFixedWidth(68)
         self.threshold_step_spin.setEnabled(False)
-        analysis_options.addWidget(self.threshold_step_spin)
+        threshold_controls.addWidget(self.threshold_step_spin)
         self.confirm_threshold_button = QPushButton("确认当前阈值")
         self.confirm_threshold_button.setEnabled(False)
         self.confirm_threshold_button.clicked.connect(self._confirm_threshold)
-        analysis_options.addWidget(self.confirm_threshold_button)
+        threshold_controls.addWidget(self.confirm_threshold_button)
         self.threshold_confirm_label = QLabel("未启用")
-        analysis_options.addWidget(self.threshold_confirm_label)
-        analysis_options.addStretch(1)
-        threshold_layout.addLayout(analysis_options)
+        threshold_controls.addWidget(self.threshold_confirm_label)
+        threshold_controls.addStretch(1)
+        threshold_layout.addLayout(threshold_controls)
         self.threshold_status_label = QLabel("启用阈值后，可在此页同时查看刷前、刷后和未染色模型。")
         self.threshold_status_label.setWordWrap(True)
         threshold_layout.addWidget(self.threshold_status_label)
@@ -369,7 +402,7 @@ class SelectableCleanlinessWindow(QMainWindow):
             )
         if selected:
             self.path_edits[key].setText(selected)
-            if key == "cleaned":
+            if key in {"cleaned", "cleaned_folder"}:
                 self.threshold_preview_mesh = None
                 self.threshold_preview_rgb = None
                 self.threshold_exposure = None
@@ -378,6 +411,48 @@ class SelectableCleanlinessWindow(QMainWindow):
                     self._apply_threshold_preview()
             if key == "segments":
                 self._reload_regions()
+
+    def _processing_mode(self) -> str:
+        return str(self.processing_mode_combo.currentData())
+
+    def _processing_mode_changed(self, _value=None) -> None:
+        if not hasattr(self, "cleaned_path_rows"):
+            return
+        folder_mode = self._processing_mode() == "folder"
+        for key, widgets in self.cleaned_path_rows.items():
+            visible = (key == "cleaned_folder") == folder_mode
+            for widget in widgets:
+                widget.setVisible(visible)
+        self.processing_mode_hint.setText(
+            "批量读取文件夹中的 PLY / OBJ / STL；所有文件共用一次确认的阈值。"
+            if folder_mode else "选择一个刷牙后牙模并计算。"
+        )
+        self.run_button.setText(
+            "开始批量计算文件夹" if folder_mode else "开始计算所选区域清洁度"
+        ) if hasattr(self, "run_button") else None
+        self.threshold_preview_mesh = None
+        self.threshold_preview_rgb = None
+        self.threshold_exposure = None
+        if getattr(self, "threshold_box", None) is not None and self.threshold_box.isChecked():
+            self.threshold_confirmed = False
+
+    @staticmethod
+    def _model_files(folder: str) -> list[Path]:
+        supported = {".ply", ".obj", ".stl"}
+        return sorted(
+            (path for path in Path(folder).iterdir()
+             if path.is_file() and path.suffix.casefold() in supported),
+            key=lambda path: path.name.casefold(),
+        )
+
+    def _effective_cleaned_preview_path(self) -> str:
+        if self._processing_mode() == "single":
+            return self.path_edits["cleaned"].text().strip()
+        folder = self.path_edits["cleaned_folder"].text().strip()
+        if not os.path.isdir(folder):
+            return ""
+        files = self._model_files(folder)
+        return str(files[0]) if files else ""
 
     def _mode(self) -> str:
         return MODE_DATA[self.mode_combo.currentText()]
@@ -446,6 +521,7 @@ class SelectableCleanlinessWindow(QMainWindow):
             "阈值已确认，可以返回主界面点击“开始计算所选区域清洁度”。"
         )
         self._apply_threshold_preview()
+        self.tabs.setCurrentWidget(self.main_tab)
 
     def _load_threshold_preview(self, report: dict) -> None:
         self.threshold_exposure = report.get("exposure_normalisation", {})
@@ -521,7 +597,11 @@ class SelectableCleanlinessWindow(QMainWindow):
             for key, name in (("unclean", "刷牙前"), ("cleaned", "刷牙后"),
                               ("baseline", "未染色")):
                 edit = self.path_edits.get(key)
-                path = edit.text().strip() if edit is not None else ""
+                path = (
+                    self._effective_cleaned_preview_path()
+                    if key == "cleaned" else
+                    edit.text().strip() if edit is not None else ""
+                )
                 if path and os.path.isfile(path):
                     mesh = pv.read(path)
                     models[name] = mesh.combine() if isinstance(mesh, pv.MultiBlock) else mesh
@@ -667,6 +747,14 @@ class SelectableCleanlinessWindow(QMainWindow):
             )
 
     def _open_auto_segmentation(self) -> None:
+        if self.frozen:
+            QMessageBox.information(
+                self,
+                "精简便携版",
+                "为控制安装包体积，精简便携版未包含 GPU 自动单牙分割模块。"
+                "清洁度计算和分区选择功能不受影响。",
+            )
+            return
         script = self.project_dir / "AutoToothSegUI.py"
         started = QProcess.startDetached(sys.executable, [str(script)], str(self.project_dir))
         if not started:
@@ -806,9 +894,22 @@ class SelectableCleanlinessWindow(QMainWindow):
 
     def _validate_paths(self) -> dict[str, str]:
         paths = {key: edit.text().strip() for key, edit in self.path_edits.items()}
-        for key in ("standard", "unclean", "cleaned"):
+        for key in ("standard", "unclean"):
             if not os.path.isfile(paths[key]):
                 raise FileNotFoundError(f"模型文件不存在：{paths[key]}")
+        if self._processing_mode() == "single":
+            if not os.path.isfile(paths["cleaned"]):
+                raise FileNotFoundError(f"刷牙后模型文件不存在：{paths['cleaned']}")
+        else:
+            if not os.path.isdir(paths["cleaned_folder"]):
+                raise FileNotFoundError(f"刷牙后模型文件夹不存在：{paths['cleaned_folder']}")
+            batch_files = self._model_files(paths["cleaned_folder"])
+            if not batch_files:
+                raise FileNotFoundError(
+                    "刷牙后模型文件夹中没有 PLY、OBJ 或 STL 模型："
+                    f"{paths['cleaned_folder']}"
+                )
+            paths["batch_files"] = batch_files
         if self.remove_baseline_box.isChecked() and not os.path.isfile(paths["baseline"]):
             raise FileNotFoundError(f"未染色原始牙模不存在：{paths['baseline']}")
         if not os.path.isdir(paths["segments"]):
@@ -972,6 +1073,123 @@ class SelectableCleanlinessWindow(QMainWindow):
             self.table.setItem(row, column, QTableWidgetItem(f"{float(value):.6f}"))
         self.table.setItem(row, 6, self._score_item(float(report.get("overall_cleanliness", 0.0))))
 
+    def _calculate_one(
+        self, paths: dict, cleaned_path: str, output_dir: str, interactive: bool,
+    ) -> dict:
+        return backend.calculate_selected_cleanliness(
+            standard_model_path=paths["standard"],
+            baseline_model_path=paths["baseline"],
+            unclean_model_path=paths["unclean"],
+            cleaned_model_path=cleaned_path,
+            segmentation_folder=paths["segments"],
+            segmentation_mode=self._mode(),
+            selected_region_names=self._selected_names(),
+            output_dir=output_dir,
+            # A batch must not open registration/grey comparison windows for
+            # every input file; those windows would block unattended processing.
+            show_matching_results=(interactive and self.show_matching_box.isChecked()),
+            show_point_cloud_comparison=(interactive and self.show_gray_box.isChecked()),
+            save_intermediate_results=self.save_intermediate_box.isChecked(),
+            remove_baseline=self.remove_baseline_box.isChecked(),
+            colour_space=self._selected_colour_space(),
+            threshold_enabled=self.threshold_box.isChecked(),
+            darkness_threshold=float(self.threshold_slider.value()),
+        )
+
+    def _render_batch_summary(self, rows: list[dict]) -> None:
+        headers = ["刷后模型文件", "状态", "整体清洁度"] + [
+            chinese for _group, chinese in GROUP_DISPLAY_ORDER
+        ] + ["结果目录"]
+        self.table.setColumnCount(len(headers))
+        self.table.setHorizontalHeaderLabels(headers)
+        self.table.setRowCount(len(rows))
+        for row_index, row in enumerate(rows):
+            self.table.setItem(row_index, 0, QTableWidgetItem(row["file_name"]))
+            self.table.setItem(row_index, 1, QTableWidgetItem(row["status"]))
+            if row["status"] == "成功":
+                self.table.setItem(
+                    row_index, 2, self._score_item(float(row["overall_cleanliness"]))
+                )
+                for offset, (group, _chinese) in enumerate(GROUP_DISPLAY_ORDER, start=3):
+                    value = row["group_scores"].get(group)
+                    self.table.setItem(
+                        row_index, offset,
+                        self._score_item(float(value)) if value is not None else QTableWidgetItem("—"),
+                    )
+            else:
+                for column in range(2, len(headers) - 1):
+                    self.table.setItem(row_index, column, QTableWidgetItem("—"))
+            self.table.setItem(row_index, len(headers) - 1, QTableWidgetItem(row["output_dir"]))
+        self.table.resizeRowsToContents()
+        self.formula_label.setText(
+            "批量模式：所有刷后模型共用当前刷前模型、分割区域、颜色空间及已确认阈值；"
+            "每行使用与单文件模式完全相同的清洁度公式。"
+        )
+
+    def _run_batch(self, paths: dict) -> None:
+        output_root = Path(paths["output"])
+        output_root.mkdir(parents=True, exist_ok=True)
+        files = list(paths["batch_files"])
+        rows = []
+        for index, cleaned_path in enumerate(files, start=1):
+            # Keep the complete source filename so A.ply and A.obj never
+            # overwrite each other's result directory.
+            output_dir = output_root / cleaned_path.name
+            self.status_label.setText(
+                f"批量计算 {index}/{len(files)}：{cleaned_path.name}"
+            )
+            QApplication.processEvents()
+            try:
+                report = self._calculate_one(
+                    paths, str(cleaned_path), str(output_dir), interactive=False
+                )
+                group_scores = {
+                    item["group"]: float(item.get("cleanliness", 0.0))
+                    for item in report.get("group_details", [])
+                }
+                rows.append({
+                    "file_name": cleaned_path.name,
+                    "status": "成功",
+                    "overall_cleanliness": float(report.get("overall_cleanliness", 0.0)),
+                    "group_scores": group_scores,
+                    "output_dir": str(output_dir),
+                    "error": "",
+                })
+            except Exception as exc:
+                traceback.print_exc()
+                rows.append({
+                    "file_name": cleaned_path.name,
+                    "status": "失败",
+                    "overall_cleanliness": "",
+                    "group_scores": {},
+                    "output_dir": str(output_dir),
+                    "error": str(exc),
+                })
+
+        summary_path = output_root / "batch_cleanliness_summary.csv"
+        headers = ["文件名", "状态", "整体清洁度"] + [
+            chinese for _group, chinese in GROUP_DISPLAY_ORDER
+        ] + ["结果目录", "错误信息"]
+        with summary_path.open("w", newline="", encoding="utf-8-sig") as fh:
+            writer = csv.writer(fh)
+            writer.writerow(headers)
+            for row in rows:
+                writer.writerow([
+                    row["file_name"], row["status"], row["overall_cleanliness"],
+                    *[row["group_scores"].get(group, "") for group, _ in GROUP_DISPLAY_ORDER],
+                    row["output_dir"], row["error"],
+                ])
+        self._render_batch_summary(rows)
+        succeeded = sum(row["status"] == "成功" for row in rows)
+        failed = len(rows) - succeeded
+        self.status_label.setText(
+            f"批量计算完成：成功 {succeeded} 个，失败 {failed} 个；汇总表：{summary_path}"
+        )
+        QMessageBox.information(
+            self, "批量计算完成",
+            f"成功：{succeeded} 个\n失败：{failed} 个\n\n汇总表：\n{summary_path}",
+        )
+
     def _run(self) -> None:
         if backend is None:
             QMessageBox.critical(self, "后端加载失败", BACKEND_IMPORT_ERROR)
@@ -992,22 +1210,11 @@ class SelectableCleanlinessWindow(QMainWindow):
         self.status_label.setText("正在执行自动配准和所选区域清洁度计算…")
         QApplication.processEvents()
         try:
-            report = backend.calculate_selected_cleanliness(
-                standard_model_path=paths["standard"],
-                baseline_model_path=paths["baseline"],
-                unclean_model_path=paths["unclean"],
-                cleaned_model_path=paths["cleaned"],
-                segmentation_folder=paths["segments"],
-                segmentation_mode=self._mode(),
-                selected_region_names=self._selected_names(),
-                output_dir=paths["output"],
-                show_matching_results=self.show_matching_box.isChecked(),
-                show_point_cloud_comparison=self.show_gray_box.isChecked(),
-                save_intermediate_results=self.save_intermediate_box.isChecked(),
-                remove_baseline=self.remove_baseline_box.isChecked(),
-                colour_space=self._selected_colour_space(),
-                threshold_enabled=self.threshold_box.isChecked(),
-                darkness_threshold=float(self.threshold_slider.value()),
+            if self._processing_mode() == "folder":
+                self._run_batch(paths)
+                return
+            report = self._calculate_one(
+                paths, paths["cleaned"], paths["output"], interactive=True
             )
             self._load_threshold_preview(report)
             self._render_report(report)
@@ -1031,6 +1238,30 @@ class SelectableCleanlinessWindow(QMainWindow):
 
 
 if __name__ == "__main__":
+    if "--smoke-test" in sys.argv:
+        smoke_log = Path(sys.executable).resolve().parent / "portable_smoke_test.log"
+        smoke_lines = [
+            "backend: OK" if backend is not None else "backend: FAILED",
+            BACKEND_IMPORT_ERROR,
+            "viewer: OK" if pv is not None and QtInteractor is not None else "viewer: FAILED",
+            VIEWER_IMPORT_ERROR,
+        ]
+        exit_code = 0
+        try:
+            if backend is None:
+                raise RuntimeError("Backend import failed")
+            if pv is None or QtInteractor is None:
+                raise RuntimeError("Viewer import failed")
+            import vtkmodules.vtkRenderingOpenGL2  # noqa: F401
+            test_mesh = pv.Sphere(theta_resolution=8, phi_resolution=8)
+            if test_mesh.n_points <= 0:
+                raise RuntimeError("PyVista smoke test did not create a mesh")
+            smoke_lines.append("vtk_rendering_and_mesh: OK")
+        except Exception:
+            exit_code = 1
+            smoke_lines.append(traceback.format_exc())
+        smoke_log.write_text("\n".join(smoke_lines), encoding="utf-8")
+        sys.exit(exit_code)
     app = QApplication(sys.argv)
     app.setAttribute(Qt.AA_UseHighDpiPixmaps, True)
     window = SelectableCleanlinessWindow()
